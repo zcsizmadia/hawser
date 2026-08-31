@@ -1,0 +1,303 @@
+# Hawser
+
+> **hawser** *(n.)* — the heavy line that moors a ship to the dock. It holds fast.
+
+A minimal, invisible way to run the upstream open source Docker Engine on Windows via WSL2. **No license fees, no Electron, no Kubernetes** — install once, `docker ps` works forever, on laptops and on CI runners alike.
+
+| | |
+|---|---|
+| License | Apache-2.0 |
+| Language | Go |
+| Target | Windows 10 2004+ / 11 |
+| Engine | upstream moby (dockerd) |
+| Binary budget | < 15 MB |
+| Telemetry | none |
+
+---
+
+## 01 · Positioning
+
+Docker Desktop requires a paid subscription for most companies. Rancher Desktop carries Kubernetes and an Electron UI whether you want them or not. Podman Desktop swaps the runtime itself. Microsoft's new WSL Containers (`wslc`, public preview 2026) mimics the docker *CLI* but not the Docker *API socket* — so compose, Testcontainers, IDE integrations, and anything that mounts `docker.sock` doesn't work with it. The remaining corner — *"I just want the real `docker` to work on Windows, free, with zero ceremony"* — is served today only by DIY wiki guides and dormant side projects. Hawser productizes that corner and nothing else.
+
+### In scope
+
+- Upstream Docker Engine (Linux containers) in a dedicated WSL2 distro
+- Named-pipe bridge so stock `docker.exe` works from any Windows shell — the real API, byte for byte
+- Lifecycle: install, autostart, crash recovery, sleep/resume survival, clean uninstall — as a real Windows service
+- Headless / CI mode: unattended install, JSON output, engine version pinning, no interactive session required
+- Desktop parity details: `host.docker.internal`, WSL distro integration, credential helper, volume path translation
+- Housekeeping: VHDX compaction, memory reclaim, engine upgrades with rollback
+- `doctor` — diagnoses WSL, VPN/DNS, proxy, and networking failures with actionable fixes
+- Bundled docker CLI + compose + buildx, wired via `docker context`
+
+### Out of scope — permanently
+
+- Windows containers (Linux containers only; say it loudly in the README)
+- Kubernetes in any form
+- Container-management GUI, dashboards, extensions — Portainer and lazydocker already work against Hawser because it's the real engine
+- Image registries, scanning, build acceleration services
+- GitHub/GitLab *hosted* Windows runners — they don't expose nested virtualization, so WSL2 cannot start there; no tool can fix that
+- macOS / Linux hosts (Colima and native engines own those)
+
+Scope discipline is the moat: the moment a Kubernetes checkbox or a management UI appears, this converges on Rancher Desktop with fewer resources. The tray menu never grows past six items.
+
+---
+
+## 02 · Architecture
+
+```
+┌───────────────────────────── Windows host ─────────────────────────────┐
+│  single Go binary, three run modes (CLI / service / tray)              │
+│                                                                        │
+│  Provisioner        Pipe proxy ★          Supervisor       Tray+doctor │
+│  rootfs download    \\.\pipe\docker_engine Windows service  status,    │
+│  verify, wsl        ⇄ engine socket,      health, restart, start/stop, │
+│  --import           path translation      boot, no login   diagnostics │
+│                                                                        │
+│   │ wsl.exe stdio relay (v0.1) → guest agent over AF_HYPERV vsock (v0.2)│
+│  ┌──────── WSL2 distro "hawser-engine" — Alpine rootfs ~80 MB ────────┐ │
+│  │  dockerd · containerd · buildkit · hawser-agent                    │ │
+│  │  → /var/run/docker.sock                                            │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+Everything Docker Desktop does on Windows is assembly of free parts — the engine is Apache-2.0, WSL2 ships with Windows, the CLI is open source. Hawser is the glue, and the pipe proxy is the load-bearing component the project is named for: stock `docker.exe` expects `\\.\pipe\docker_engine`, and bridging it faithfully (streams, hijacked connections for `attach`/`exec`, half-closes, Windows→WSL volume path translation) is what makes every existing tool — Testcontainers, IDEs, CI scripts — work unmodified.
+
+**Endpoints.** Every endpoint is a bog-standard dockerd endpoint, so `DOCKER_HOST`, `docker context`, and every SDK behave exactly as Docker documents them:
+
+- The named pipe on Windows (default, via the `hawser` context; falls back to `\\.\pipe\hawser_engine` when Docker Desktop owns the default pipe, so both coexist)
+- A Unix socket shared to the user's other WSL distros at `/mnt/wsl/hawser/docker.sock`
+- An opt-in mutual-TLS TCP endpoint (`hawser expose --tcp`) for tools that can't speak npipe
+
+Never an unauthenticated TCP daemon.
+
+---
+
+## 03 · Control surfaces
+
+**CLI — the product.** Every capability lives here; everything else is a veneer over it. Scriptable from day one: meaningful exit codes, `--json` on status and doctor, no interactive prompts in `--headless` mode. Day-to-day container work stays in `docker` — Hawser's CLI only manages the engine's existence.
+
+**Tray — a status light, ≤ 6 items forever.** Status dot · Start/Stop/Restart · Open logs · Run doctor · Check updates · Quit. Each item invokes the CLI underneath. No settings dialogs, no container lists — that cap is a hard rule, because the tray is where scope creep would start.
+
+**Service — the always-on layer.** A real Windows service supervises the distro and dockerd: boot-time start without an interactive login, crash restart, sleep/resume recovery. The tray is optional garnish on top; on a CI runner the service runs with no UI at all.
+
+**GUI — deliberately never.** Because Hawser serves the standard Docker API, every existing frontend just works: Portainer, lazydocker, Dockge, VS Code. The README shows the Portainer one-liner — converting "where's the GUI?" into a demo of the compatibility promise.
+
+```
+hawser install [--headless] [--engine-version X]   # provision, wire context; unattended for fleets
+hawser uninstall / reset                           # clean removal; factory reset offers image export first
+hawser start / stop / restart / status [--json]    # engine lifecycle, machine-readable state
+hawser version [--json]                            # every component + which docker.exe is actually in use
+hawser doctor [--fix] [--report]                   # diagnose WSL/VPN/DNS/proxy/pipe/disk; emit markdown for issues
+hawser engine upgrade / rollback                   # pinned, checksummed engine updates, independent of app releases
+hawser compact                                     # VHDX compaction + memory reclaim
+hawser wsl-integrate <distro>                      # share socket + docker CLI into the user's Ubuntu etc.
+hawser expose --tcp                                # opt-in mTLS TCP endpoint for npipe-less tools
+hawser logs                                        # engine + service logs
+hawser migrate --from-desktop                      # pull images/volumes/build cache out of Docker Desktop
+hawser stats                                       # vmmem attributed: engine vs other distros, reclaimable
+hawser enable-qemu                                 # binfmt/QEMU for multi-arch buildx (--platform linux/arm64)
+hawser snapshot create / restore                   # checkpoint entire engine state (VHDX copy while stopped)
+hawser create --name <x> [--engine-version Y]      # side-by-side isolated engines, each its own context
+hawser cache enable                                # local pull-through registry mirror
+```
+
+---
+
+## 04 · Key decisions
+
+**Go, single binary.** `Microsoft/go-winio` gives named pipes for free (it's what Docker itself uses on Windows); moby client libraries, trivial cross-compilation, and the Docker-ecosystem contributor pool are all Go. A thin native shell remains an option later if the UI ever needs toasts or MSIX — the core never moves.
+
+**Two-stage pipe bridge.** v0.1 spawns `wsl.exe` per connection and relays stdio to the Unix socket — simple, secure, provable in a weekend. v0.2 replaces it with a persistent guest agent over AF_HYPERV vsock to eliminate the ~150 ms per-connection spawn cost. Never a TCP daemon: an unauthenticated `localhost:2375` is reachable by browsers and every local process; the named pipe gets an ACL for the interactive user + administrators.
+
+**Dedicated distro, not the user's.** Imported as `hawser-engine` so it never collides with someone's Ubuntu. Rootfs is Alpine + pinned static engine binaries from `download.docker.com`, assembled by CI into a tar published as a checksummed GitHub release asset with an SBOM. One distro holds engine and data together (Docker Desktop's own lesson — it dropped its `-data` companion distro); upgrades swap static binaries in place, so data is never at risk.
+
+**Config touches, scoped.** Everything possible goes in per-distro config (`/etc/wsl.conf`, `daemon.json`) affecting only Hawser's distro. The global `.wslconfig` — memory limits, mirrored networking — is shared by the user's own distros, so anything global is written only with explicit consent (install prompt or `doctor --fix`), never silently.
+
+**Bundle the docker CLI.** CLI + compose + buildx are Apache-2.0 and redistributable unmodified, alongside `docker-credential-wincred` so registry logins persist in Windows Credential Manager. Wired with `docker context create hawser` — coexists with Docker Desktop instead of fighting it, which makes trial adoption zero-risk (and `DOCKER_HOST` flips between them per-shell).
+
+**Versioning contract.** Every Hawser release carries a **locked version manifest** — app, service, guest agent, rootfs, engine (dockerd/containerd/runc), CLI + compose/buildx/wincred plugins, each with version and checksum — published as JSON with the release. Nothing is fetched as "latest at install time"; the CLI is the newest stable *at release cut*, pinned. CLI↔engine skew is safe by design (Docker's API version negotiation) but bounded: `engine upgrade` refuses combinations outside the tested matrix unless forced, and upgrades are staged swaps with rollback. **`hawser version` makes it all visible**: every component version, which `docker.exe` is actually first on PATH and where it came from (Hawser's, Desktop's, winget's), the active context, and the negotiated API version — so "which docker am I running?" is a command, not an archaeology project.
+
+**Apache-2.0.** Matches moby/containerd, carries a patent grant, and keeps enterprise legal reviews short — the target audience is exactly the companies that left Docker Desktop over licensing.
+
+**The name.** *Hawser* — chosen over Longshore, Gantry, and Subdock. It names the mechanism: the product's load-bearing component is the line mooring the Windows shore to the engine ship, and "holds fast" is the reliability promise. No "docker" or whale anywhere (Docker, Inc. trademarks — a launch-blocking constraint); namespace is nearly empty (the name's only prior dev use was git-lfs's 2015 prototype, long forgotten). Org/package/domain reservation is first-week work.
+
+---
+
+## 05 · Roadmap
+
+### v0.1 — Plumbing (~3 weekends)
+
+CLI-only, end to end. This alone is shippable and useful — everything after it is reliability and polish.
+
+- [ ] Preflight: detect WSL2 / virtualization state (`wsl --status`); if missing, print the exact enable-and-reboot instructions rather than attempting elevation
+- [ ] Rootfs pipeline in GitHub Actions: Alpine + pinned static dockerd/containerd/buildkit → tar → checksummed release asset + SBOM
+- [ ] `hawser install`: download + verify rootfs, `wsl --import`, write `daemon.json` (log rotation on by default, `host.docker.internal` wired up), start dockerd — with `--headless` and `--engine-version` from day one
+- [ ] Pipe proxy v1: `go-winio` named-pipe server, per-connection `wsl.exe` stdio relay, correct half-close and stream-hijack handling, Windows→WSL volume path translation (`-v C:\src:/app` just works)
+- [ ] Bundle docker CLI + compose + buildx + `docker-credential-wincred` into Hawser's own `bin\` dir per the version manifest; create and select the `hawser` context (fall back to own pipe name if Docker Desktop is present). Detect any existing `docker.exe` on PATH — never shadow it silently, report which binary wins
+- [ ] `hawser version [--json]`: full component report — app/service/agent/rootfs/engine/CLI+plugin versions, which `docker.exe` is active on PATH and whose it is, active context, negotiated API version
+- [ ] `hawser uninstall`: unregister distro, remove pipe, restore previous context — nothing else on the system was modified
+
+**Acceptance:** On a fresh Windows 11 VM: install → `docker run hello-world` succeeds in under 5 minutes without the user touching WSL. A real compose stack (multi-service, healthcheck-gated `depends_on`, Windows-path bind mounts, `logs -f`) runs `up --build` → `down` cleanly — compose is a headline claim, and it exercises exactly the proxy's streaming, hijack, and path-translation correctness.
+
+### v0.2 — Always-on (~3 weekends)
+
+The "it just disappears" milestone: survives everything Windows throws at it without user action — including running with nobody logged in.
+
+- [ ] Windows service (`x/sys/windows/svc`): supervises the distro and dockerd, restarts on WSL crashes, starts at boot
+- [ ] Session-0 / no-login operation: run under a dedicated service account (or boot-time scheduled task with the account's token) so CI runners work unattended — Docker Desktop never solved this; solving it is a differentiator
+- [ ] Guest agent over AF_HYPERV vsock replaces per-connection spawning; latency parity with Docker Desktop
+- [ ] On-demand start + optional idle shutdown (`hawser config set idle-timeout 30m`): engine starts on first pipe connection (~2s cold start), stops when no containers run and the pipe is quiet — answers the #1 laptop complaint (idle RAM)
+- [ ] Sleep/resume and network-change recovery: re-verify socket health on power events, reconnect silently
+- [ ] `hawser wsl-integrate`: socket + CLI shared into the user's other distros via `/mnt/wsl` (Desktop parity)
+- [ ] `hawser migrate --from-desktop`: copy images, volumes, and build cache out of Docker Desktop's distro — turns "try Hawser" into a 10-minute reversible experiment instead of a fresh start; the single biggest adoption lever
+- [ ] Tray icon (6 items, forever): status dot, start/stop/restart, open logs, run doctor, quit
+- [ ] Structured logging to the Windows Event Log and a rotating file
+
+**Acceptance:** Kill `wsl.exe`, reboot, or sleep/resume — the next `docker ps` works with no user action. A service-account install runs with no user logged in.
+
+### v0.3 — Doctor, VPN & housekeeping (~3 weekends)
+
+The differentiator over DIY guides: turn the WSL2 quirk zoo — VPNs above all — from an issue-tracker flood into a diagnosable surface.
+
+- [ ] `hawser doctor`: WSL version, virtualization, VPN DNS breakage, pipe ACL/health, port conflicts, MTU/route reachability, disk usage — each with an actionable fix, not just a red X; `--report` emits markdown ready to paste into a GitHub issue
+- [ ] Version-sanity checks in doctor: PATH shadowing (a foreign `docker.exe` resolving ahead of Hawser's while the `hawser` context is active), CLI↔engine API skew outside the tested matrix, agent/rootfs/app manifest mismatch after a partial upgrade
+- [ ] Prefer the platform fix for VPNs: apply `networkingMode=mirrored`, `dnsTunneling`, `autoProxy` where the Windows build supports them (global config → explicit consent)
+- [ ] VPN known-issues database: fingerprint GlobalProtect / AnyConnect / Zscaler patterns → named fix; fallbacks for hostile setups (static DNS pinning, MTU clamping, opt-in `hawser vpn-workaround` relay in the wsl-vpnkit style)
+- [ ] Corporate proxy + registry mirrors as first-class config: `HTTP_PROXY`/`NO_PROXY` for dockerd, mirror settings, doctor checks for both
+- [ ] VHDX management: sparse VHDX where supported, one-click compaction, memory reclaim, sane `.wslconfig` defaults with consent
+- [ ] `hawser engine upgrade`: pinned, checksummed engine updates with rollback — engine security patches decoupled from app releases
+- [ ] `hawser stats`: vmmem attribution ("WSL VM total 12 GB — hawser-engine 3.1 GB, your Ubuntu 8.9 GB, reclaimable 4 GB") — defuses the most common WSL2 false alarm
+- [ ] `hawser enable-qemu`: register binfmt/QEMU handlers so `buildx --platform linux/arm64` works out of the box (Desktop parity for multi-arch builds)
+- [ ] SSH agent bridging: expose the Windows ssh-agent named pipe as a Unix socket in the engine and `wsl-integrate`'d distros, so `docker build --ssh default` and `SSH_AUTH_SOCK` mounts just work — Hawser already owns a pipe⇄socket relay, and nobody does this natively
+
+**Acceptance:** The doctor correctly diagnoses the five most common failure classes reported in v0.1/v0.2 issues, and a GlobalProtect-equipped test machine reaches a registry through the tunnel after `doctor --fix`.
+
+### v0.4 — Ship it (~2 weekends)
+
+Distribution and trust — the difference between a repo and a tool people install at work.
+
+- [ ] winget, scoop, and chocolatey manifests; WiX MSI for Intune/Ansible fleet deployment
+- [ ] Code signing via Azure Trusted Signing or SignPath's OSS program; published checksums; SmartScreen reputation plan
+- [ ] `hawser expose --tcp`: opt-in mutual-TLS TCP endpoint with generated certs, for SDKs that can't speak npipe
+- [ ] Opt-in LAN port mirroring (`netsh interface portproxy`) for published container ports
+- [ ] Enterprise policy layer: ADMX template + registry keys for what admins actually lock down (pin/forbid engine versions, disable `expose --tcp`, lock registry mirrors, disable LAN mirroring)
+- [ ] Validate and document compatibility with Microsoft Defender for Endpoint's WSL plugin, so `hawser-engine` workloads are visible to EDR
+- [ ] Docs site, demo GIF, comparison table vs Desktop/Rancher/Podman/wslc, CONTRIBUTING + issue templates (doctor --report pre-wired into the bug template)
+
+**Acceptance:** `winget install hawser` works on a clean machine with no SmartScreen wall.
+
+### v0.5 — Power tools (~2 weekends)
+
+Advanced-user features no other Docker product on Windows offers — kept out of v0.4 so the ship-it release stays tight.
+
+- [ ] `hawser snapshot create / restore`: checkpoint the entire engine state (VHDX copy while stopped)
+- [ ] `hawser create --name edge --engine-version 28.0-rc`: multiple side-by-side isolated engines, each its own distro + docker context — Desktop fundamentally can't
+- [ ] Opt-in prune policy (scheduled `system prune` rules) + tray disk-quota alerts *before* the VHDX eats the drive
+- [ ] `hawser cache enable`: local pull-through registry mirror (`registry:2`) wired into `daemon.json`
+- [ ] PowerShell + bash completions for the hawser CLI
+
+**Acceptance:** Snapshot → break everything → restore round-trips bit-perfect; two engines run simultaneously with independent contexts.
+
+### v1.0 — Stable (ongoing)
+
+Boring on purpose: reliability guarantees, not features.
+
+- [ ] End-to-end suite on a self-hosted Windows runner with nested virtualization (GitHub-hosted runners can't run WSL2)
+- [ ] Compatibility matrix across Windows 10 22H2 / 11 / Insider; WSL version pinning policy
+- [ ] Semantic versioning, upgrade guarantees, published threat model for the pipe (so security teams can approve it)
+- [ ] Checkpoint: the concrete tripwire is **movement on microsoft/WSL#40976** (a Docker Engine API endpoint for wslc — today unanswered, no milestone), not wslc GA itself, which ships without it. A maintainer reply, a milestone, or a `settings.yaml` endpoint in release notes triggers a deliberate positioning review
+- [ ] Platform watch-list — wslc's under-the-hood work is WSL platform investment Hawser may inherit for free: adopt **virtiofs** file sharing the day it reaches standard distros (attacks the slow-9P bind-mount problem), fold **consomme networking** into `doctor --fix` as the preferred VPN remedy if exposed, and shrink `compact`/reclaim to a thin wrapper if the memory-reclaim improvements ship platform-wide
+
+**Acceptance:** Two consecutive Windows feature updates absorbed with zero breaking issues filed.
+
+---
+
+## 06 · CI/CD & automation
+
+Possibly the sharpest wedge market: **self-hosted Windows CI runners that need Linux containers**. A .NET or desktop shop's build machines need Testcontainers, Linux image builds, or a database sidecar mid-pipeline — and today their options are a paid Docker Desktop license (which also wants an interactive session and a tray app, and auto-updates mid-pipeline), a second Linux runner, or hand-rolled WSL scripts that rot. The pain is monetary and acute, the buyer is a platform team that adopts CLI tools without a beauty contest, and there is no GUI expectation to disappoint.
+
+```powershell
+# runner provisioning script — GitHub Actions, GitLab shell executor, Jenkins, Azure DevOps alike
+hawser install --headless --engine-version 27.5.1
+hawser status --json   # assert health, then every pipeline step just uses `docker`
+```
+
+What makes it first-class rather than incidental: unattended everything (no prompts, meaningful exit codes, `--json`), **version pinning as a contract** (no auto-updates unless asked — determinism is a direct anti-feature of Docker Desktop), service operation with no logged-in user (the session-0 work in v0.2), MSI/winget for fleet rollout, and pre-baked rootfs VHDX caching so ephemeral runners provision in seconds. GitLab's docker executor pointing at Hawser's pipe for Linux jobs on a Windows runner is a bonus scenario.
+
+Two boundaries, stated honestly: GitHub/GitLab *hosted* Windows runners cannot work (no nested virtualization — a hypervisor policy, not a software gap), and Hyper-V guest VMs used as runners need nested virtualization enabled on their host. Notably, Microsoft's `wslc` doesn't threaten this niche: CI workloads are exactly the Docker-API-dependent tools it can't run.
+
+---
+
+## 07 · VPN & corporate environments
+
+The user behind a corporate VPN is the plan's hardest ordinary case — it's why doctor is a milestone, not a footnote. The key fact: the VPN **cannot break the control path** (docker CLI ⇄ engine is a local pipe, no routing involved); what breaks is **egress from inside WSL2** — DNS hijacked by the VPN client, routes/MTU claimed by full tunnels, internal registries reachable only through the tunnel plus a proxy.
+
+The strategy, in order: **platform fixes first** (mirrored networking + DNS tunneling + auto-proxy resolve most VPN cases with zero per-VPN hacks), **diagnosis second** (doctor fingerprints known VPN clients and names the specific fix instead of failing silently — turning tribal Stack Overflow knowledge into a command), **workarounds last** (static DNS, MTU clamps, an opt-in relay that routes WSL traffic through the Windows side so it rides the VPN like any Windows app). Some enterprise full-tunnel configurations will still win — the honest promise is diagnosis with actionable output, which already beats Docker Desktop's silent failure mode.
+
+The corporate trust checklist rides along: signed binaries and MSI from the first public release, reproducible rootfs with SBOM and checksums (a security team can diff exactly what's in the VM), a published threat model for the pipe, an ADMX/registry policy layer for admins (v0.4), documented compatibility with Defender for Endpoint's WSL plugin so container workloads stay visible to EDR, Apache-2.0 for short legal reviews, and **no telemetry** — nothing phones home except explicit update checks.
+
+---
+
+## 08 · Repository layout
+
+```
+hawser/
+├── cmd/hawser/             # single entry: CLI, service, and tray run modes
+├── internal/
+│   ├── provision/          # rootfs download/verify, wsl --import, daemon.json
+│   ├── pipeproxy/          # named pipe server ⇄ engine socket, path translation   ← load-bearing
+│   ├── engine/             # lifecycle, health checks, upgrade/rollback, API client
+│   ├── wsl/                # wsl.exe wrappers, .wslconfig, vhdx ops (mockable interface)
+│   ├── doctor/             # diagnostic checks, each check = one file + one test; VPN fingerprints
+│   ├── svc/                # Windows service glue, session-0 operation, power events
+│   └── tray/               # systray UI (6 items max)
+├── guest/
+│   ├── rootfs/             # Alpine build scripts → tar + SBOM (runs in CI)
+│   └── agent/              # vsock guest agent: relay, health, housekeeping (v0.2)
+├── installer/              # winget/scoop/choco manifests, WiX MSI
+└── .github/workflows/      # build, rootfs pipeline, release signing
+```
+
+The `wsl` package hides every `wsl.exe` invocation behind an interface so unit tests run anywhere; only the e2e suite needs real nested virtualization.
+
+---
+
+## 09 · Risks
+
+| Risk | Severity | Mitigation |
+|---|---|---|
+| Docker trademark | launch-blocking | No "docker" or whale in name/logo/package IDs (hence Hawser); nominative references only; ship CLI binaries unmodified under Apache-2.0. Legal sanity check before the repo goes public. |
+| Microsoft's wslc absorbs the niche | strategic | wslc (GA expected fall 2026) mimics the CLI but has no daemon and no API socket at all — compose, Testcontainers, and socket-mounting tools are architecturally out of reach, and the endpoint request (microsoft/WSL#40976) sits unanswered with no milestone. Ship v0.1 fast and own the "real Docker API" framing. If #40976 ever ships, the pre-thought pivot: Hawser's glue layer (doctor, service lifecycle, fleet policy, path-translating pipe) can sit on top of wslc's endpoint instead of its own distro. |
+| Session-0 / no-login WSL | technical | WSL2's utility VM is per-user and historically assumes a logged-on session; running it from a service is a known rough area. Week-1 spike (not v1.0 discovery); dedicated service-account pattern; boot-time scheduled task with the account's token as fallback. |
+| WSL2 behavior drift | ongoing | Pin a minimum WSL version; doctor detects mismatches; abstract every `wsl.exe` call; test Insider builds before Windows feature updates land. |
+| CI can't run WSL2 | medium | GitHub-hosted Windows runners lack nested virtualization. Keep unit tests host-independent; one self-hosted runner (or a paid larger runner) for the e2e suite. |
+| SmartScreen / unsigned binaries | medium | Sign from the first public release (Azure Trusted Signing is ~$10/mo; SignPath is free for OSS); winget distribution builds reputation fastest. container-desktop's Defender-blocked installer is the cautionary tale. |
+| Corporate VPN / DNS breakage | chronic | The #1 WSL2 support topic everywhere — treated as a product surface, not an issue label: platform fixes, fingerprint database, doctor --fix, opt-in relay (section 07). |
+| Pipe security | design-time | ACL the pipe to interactive user + admins; TCP only as opt-in mutual-TLS; publish a short threat model so security teams can approve it. |
+
+---
+
+## 10 · Success metrics
+
+- **< 5 min** — fresh machine → first successful `docker run`
+- **< 15 MB** — installed Windows-side footprint (vs ~500 MB incumbents)
+- **< 30 MB** — idle RAM of all Windows-side processes
+- **0 clicks** — recovery after reboot, sleep, or WSL crash
+- **0 prompts** — unattended install on a CI runner, no user logged in
+
+---
+
+## 11 · First week
+
+1. **Claim the name.** Hawser is chosen — reserve the GitHub org, winget/scoop/choco IDs, and a domain; quick USPTO/EUIPO sanity search. Then never revisit.
+2. **Manual spike — prove the whole path by hand.** Import a hand-built Alpine+dockerd tar, relay the pipe with a throwaway script, run `docker ps` from PowerShell. Every architectural risk surfaces here, before any real code exists.
+3. **Session-0 spike.** Start WSL2 + dockerd from a Windows service with no user logged in (dedicated service account; scheduled-task fallback). This is the CI use case's one real unknown — settle it now, not in v1.0.
+4. **Repo + CI skeleton.** Apache-2.0, Go module, lint/test workflow, and the rootfs build pipeline publishing a checksummed tar + SBOM as a release asset.
+5. **Pipe proxy in Go.** `go-winio` server + per-connection relay, with tests covering half-close, hijacked streams (`exec -it`), path translation, and concurrent connections.
+6. **Wrap it: `hawser install`.** Provisioner + context wiring, tested on a clean Windows 11 VM. That's v0.1 within reach.
+
+---
+
+*draft 5 · 2026-08-31 · plan owner: zcsizmadia · name settled: Hawser · wslc tripwire: microsoft/WSL#40976 · next review: after the manual + session-0 spikes*
