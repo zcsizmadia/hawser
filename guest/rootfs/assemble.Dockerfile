@@ -23,6 +23,9 @@ FROM alpine:${ALPINE_TAG}
 #   tini-static         becomes docker-init, which `docker run --init` needs.
 #                       moby vendors tini rather than exposing a make target
 #                       for it, so it comes from Alpine (also MIT-licensed).
+#                       Copied rather than symlinked: an absolute symlink
+#                       dangles whenever the rootfs is inspected from outside,
+#                       which is exactly what the smoke test does.
 RUN apk add --no-cache \
         socat \
         iptables ip6tables iproute2 \
@@ -31,7 +34,7 @@ RUN apk add --no-cache \
         kmod util-linux \
         pigz xz \
         tini-static \
-    && ln -s /sbin/tini-static /usr/local/bin/docker-init
+    && cp /sbin/tini-static /usr/local/bin/docker-init
 
 COPY bin/ /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/*

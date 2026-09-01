@@ -83,7 +83,9 @@ echo "==> runtime dependencies the engine and bridge need at boot"
 for dep in socat iptables ip6tables docker-init nsenter modprobe pigz; do
     found=""
     for d in bin sbin usr/bin usr/sbin usr/local/bin; do
-        if [ -e "$work/$d/$dep" ]; then
+        # -L as well as -e: an absolute symlink inside the rootfs dangles when
+        # inspected from outside it, and is still a present dependency.
+        if [ -e "$work/$d/$dep" ] || [ -L "$work/$d/$dep" ]; then
             found="$d/$dep"
             break
         fi
