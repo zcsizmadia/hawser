@@ -8,6 +8,9 @@ apk add --no-cache git make bash musl-dev gcc libseccomp-dev libseccomp-static \
     btrfs-progs-dev linux-headers pkgconf
 
 mkdir -p /out/bin /src
+# Start clean: the output dir may be a reused cache directory (see BIN_DIR in
+# build.sh), and commits.txt is appended to below.
+: > /out/commits.txt
 export CGO_ENABLED=0
 export GOFLAGS=-trimpath
 

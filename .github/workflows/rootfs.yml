@@ -28,14 +28,30 @@ jobs:
   build:
     name: build rootfs
     runs-on: ubuntu-latest
-    # The from-source engine build takes ~30 min; on PRs it only runs when the
-    # rootfs itself changed (see paths filter), which is what we want to gate.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
+      # Compiling the engine is ~4 min of the job; assembling the rootfs is
+      # seconds. Cache only the binaries, keyed on what actually determines
+      # them, so editing daemon.json or wsl.conf still rebuilds the tarball
+      # from cached binaries. No restore-keys: a partial match would hand us
+      # binaries built from different pins, which is worse than a cache miss.
+      - name: engine binary cache
+        id: engine-cache
+        uses: actions/cache@v4
+        with:
+          path: engine-bin
+          key: engine-bin-${{ runner.os }}-${{ hashFiles('guest/rootfs/versions.env', 'guest/rootfs/build-engine.sh') }}
+
       - name: build
+        env:
+          BIN_DIR: ${{ github.workspace }}/engine-bin
         run: ./guest/rootfs/build.sh "$GITHUB_WORKSPACE/out"
+
+      - name: report cache outcome
+        run: |
+          echo "engine cache hit: ${{ steps.engine-cache.outputs.cache-hit || 'false' }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: smoke test the rootfs
         run: ./guest/rootfs/smoke-test.sh "$GITHUB_WORKSPACE/out"

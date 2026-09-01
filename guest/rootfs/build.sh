@@ -25,30 +25,50 @@ curl -fsSL -o "$work/$base" "$url"
 curl -fsSL -o "$work/$base.sha256" "$url.sha256"
 (cd "$work" && sha256sum -c "$base.sha256")
 
-echo "==> building engine binaries from source (this is the slow part)"
-# Each component is built in a pinned golang image from its upstream git tag —
-# no download.docker.com artifacts, so provenance is source -> binary end to end.
-# HOST_UID/GID: the build runs as root in the container but writes into a host
-# directory, so it hands ownership back before exiting — otherwise cleanup and
-# the tar step hit permission errors on the CI runner.
-docker run --rm \
-  -v "$work:/out" \
-  -e "MOBY_TAG=$MOBY_TAG" \
-  -e "ENGINE_VERSION=$ENGINE_VERSION" \
-  -e "CONTAINERD_VERSION=$CONTAINERD_VERSION" \
-  -e "RUNC_VERSION=$RUNC_VERSION" \
-  -e "BUILDKIT_VERSION=$BUILDKIT_VERSION" \
-  -e "HOST_UID=$(id -u)" \
-  -e "HOST_GID=$(id -g)" \
-  -v "$here/build-engine.sh:/build-engine.sh:ro" \
-  "golang:${GO_VERSION}-alpine" sh /build-engine.sh
+# Engine binaries are the slow part (~4 min of compiling). BIN_DIR lets a caller
+# supply a directory that persists across runs — CI points it at an actions/cache
+# entry keyed on the pins below, so a config-only change re-assembles the rootfs
+# without recompiling anything. Layout: $BIN_DIR/bin/* plus $BIN_DIR/commits.txt.
+engine="${BIN_DIR:-$work/engine}"
+mkdir -p "$engine"
+
+if [ -x "$engine/bin/dockerd" ] && [ -s "$engine/commits.txt" ]; then
+    echo "==> reusing engine binaries from $engine"
+    # The cache key covers versions.env, but a stale or mismatched entry would
+    # otherwise ship silently — so confirm the binary is the pinned version.
+    if ! "$engine/bin/dockerd" --version | grep -q "$ENGINE_VERSION"; then
+        echo "cached dockerd is not $ENGINE_VERSION - rebuilding" >&2
+        rm -rf "$engine"
+        mkdir -p "$engine"
+    fi
+fi
+
+if [ ! -x "$engine/bin/dockerd" ]; then
+    echo "==> building engine binaries from source (this is the slow part)"
+    # Each component is built in a pinned golang image from its upstream git tag —
+    # no download.docker.com artifacts, so provenance is source -> binary end to end.
+    # HOST_UID/GID: the build runs as root in the container but writes into a host
+    # directory, so it hands ownership back before exiting — otherwise cleanup and
+    # the tar step hit permission errors on the CI runner.
+    docker run --rm \
+      -v "$engine:/out" \
+      -e "MOBY_TAG=$MOBY_TAG" \
+      -e "ENGINE_VERSION=$ENGINE_VERSION" \
+      -e "CONTAINERD_VERSION=$CONTAINERD_VERSION" \
+      -e "RUNC_VERSION=$RUNC_VERSION" \
+      -e "BUILDKIT_VERSION=$BUILDKIT_VERSION" \
+      -e "HOST_UID=$(id -u)" \
+      -e "HOST_GID=$(id -g)" \
+      -v "$here/build-engine.sh:/build-engine.sh:ro" \
+      "golang:${GO_VERSION}-alpine" sh /build-engine.sh
+fi
 
 echo "==> assembling rootfs"
 root="$work/rootfs"
 mkdir -p "$root"
 tar -xzf "$work/$base" -C "$root"
 install -d "$root/usr/local/bin" "$root/etc/docker" "$root/etc/hawser"
-install -m 0755 "$work/bin/"* "$root/usr/local/bin/"
+install -m 0755 "$engine/bin/"* "$root/usr/local/bin/"
 
 # Engine defaults: log rotation on from the first run (PLAN §05 v0.1).
 cat > "$root/etc/docker/daemon.json" <<'JSON'
@@ -76,7 +96,7 @@ CONF
 printf '%s\n' "$ENGINE_VERSION" > "$root/etc/hawser/engine-version"
 # Exact upstream commit each binary was built from — the provenance record
 # `hawser version` and a security review both read.
-install -m 0644 "$work/commits.txt" "$root/etc/hawser/commits"
+install -m 0644 "$engine/commits.txt" "$root/etc/hawser/commits"
 
 tarball="$out/hawser-rootfs-${ENGINE_VERSION}.tar.gz"
 echo "==> writing $tarball"
