@@ -6,9 +6,31 @@ A minimal, invisible way to run the upstream open source **Docker Engine on Wind
 No license fees, no Electron, no Kubernetes — install once, `docker ps` works forever, on
 laptops and CI runners alike.
 
-**Status: pre-alpha.** Nothing installable yet — the architecture spikes are in progress.
-Read [PLAN.md](PLAN.md) for the strategy and [ROADMAP.md](ROADMAP.md) for the schedule;
-the [issue tracker](https://github.com/zcsizmadia/hawser/issues) is the live state.
+**Status: v0.1 pre-release.** Installable and working; the always-on supervisor, tray,
+and doctor are still ahead. Read [PLAN.md](PLAN.md) for the strategy and
+[ROADMAP.md](ROADMAP.md) for the schedule; the
+[issue tracker](https://github.com/zcsizmadia/hawser/issues) is the live state.
+
+## Install (v0.1)
+
+Requirements: Windows 11 with WSL2, and any `docker` CLI on PATH (Docker Desktop's works —
+Hawser coexists with it rather than replacing it).
+
+1. Download the zip for your architecture from the
+   [latest release](https://github.com/zcsizmadia/hawser/releases) and verify it against
+   `SHA256SUMS` (binaries are not yet signed; SmartScreen will warn)
+2. `hawser.exe install` — downloads the checksum-verified engine rootfs, imports it as the
+   `hawser-engine` WSL2 distro, starts the engine, and wires a `hawser` docker context
+3. `hawser.exe proxy` — serves the named pipe (keep it running; the v0.2 supervisor
+   replaces this step)
+4. In another shell: `docker --context hawser run --rm hello-world`
+
+`hawser.exe uninstall` removes everything Hawser created — the distro and all images and
+volumes in it — and restores your previous docker context. Nothing else on the system is
+touched.
+
+Known v0.1 limits: a logged-on session is required (a WSL2 platform constraint that binds
+every WSL-based engine), the proxy runs in the foreground, and Linux containers only.
 
 ## What it will be
 
