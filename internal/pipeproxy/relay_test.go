@@ -341,18 +341,19 @@ func TestDialFailureClosesClient(t *testing.T) {
 	}
 }
 
-func TestOnAcceptWraps(t *testing.T) {
-	// The hook the HTTP-rewriting layer will use.
+func TestCustomHandlerReplacesRelay(t *testing.T) {
+	// The seam RewriteBinds plugs into: a handler fully replaces the default
+	// byte relay rather than wrapping the connection.
 	srv := newServer(t, func(c net.Conn) { io.Copy(c, c) })
 	var called bool
 	var mu sync.Mutex
 	proxy := &pipeproxy.Server{
 		Dialer: srv.dialer(),
-		OnAccept: func(c net.Conn) net.Conn {
+		Handler: func(c net.Conn, e io.ReadWriteCloser) error {
 			mu.Lock()
 			called = true
 			mu.Unlock()
-			return c
+			return pipeproxy.Relay(c, e)
 		},
 	}
 	addr, stop := startProxy(t, proxy)
@@ -370,6 +371,6 @@ func TestOnAcceptWraps(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if !called {
-		t.Error("OnAccept was not called")
+		t.Error("custom Handler was not called")
 	}
 }
