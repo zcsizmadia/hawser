@@ -14,7 +14,7 @@ Everything here either de-risks the architecture or claims ground that gets more
 |---|---|---|---|
 | 0.1 | Reserve the name: GitHub org, winget/scoop/choco IDs, domain, USPTO/EUIPO sanity search | reservations done | — |
 | 0.2 | **Spike A — manual end-to-end**: hand-built Alpine+dockerd tar, `wsl --import`, throwaway pipe relay script, `docker ps` from PowerShell (download.docker.com static bundle OK here only) | written spike notes: latency, half-close behavior, gotchas | **GO/NO-GO: the path works at all** |
-| 0.3 | ~~**Spike B — session-0**~~ **DONE (#3): NO-GO.** WSL2 will not create its utility VM outside an interactive session — LocalSystem refused by name, a dedicated account fails in HCS with `ERROR_LOGON_TYPE_NOT_GRANTED` even holding Service+Batch+Interactive rights and local admin | the constraint, measured | CI story now rests on auto-logon; PLAN §03/§06/§09 rewritten |
+| 0.3 | **Spike B — session-0**: **PROVISIONAL NO-GO, re-test pending.** Ran on a machine missing `NT VIRTUAL MACHINE\Virtual Machines` from `SeServiceLogonRight` — the documented cause of the error measured. Re-run on a clean VM. Original finding: WSL2 will not create its utility VM outside an interactive session — LocalSystem refused by name, a dedicated account fails in HCS with `ERROR_LOGON_TYPE_NOT_GRANTED` even holding Service+Batch+Interactive rights and local admin | the constraint, measured | CI story now rests on auto-logon; PLAN §03/§06/§09 rewritten |
 | 0.4 | Repo skeleton: Apache-2.0, Go module, lint/test workflow, layout from PLAN §08 | pushable repo (private) | — |
 | 0.5 | Rootfs CI pipeline v0: Alpine + engine **built from moby/containerd/runc source**, tar + SHA256 + SBOM as release asset | reproducible rootfs artifact | blocks 1.2 |
 
