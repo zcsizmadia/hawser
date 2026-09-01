@@ -1,0 +1,150 @@
+name: release
+
+# Builds and attaches the hawser binaries when an app release is published.
+#
+# Rootfs releases are a separate namespace (tag prefix rootfs-) handled by
+# rootfs.yml; this workflow skips them so the two never cross-contaminate.
+#
+# Signing is deliberately absent: it lands in v0.4 (#1 milestone), and pretending
+# otherwise would be worse than the honest gap. Checksums are published so a
+# download can at least be verified against the release page.
+
+on:
+  release:
+    types: [published]
+  # Lets the whole build be exercised without publishing anything.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version string to stamp (dry run only, nothing is uploaded)'
+        required: false
+        default: '0.0.0-dryrun'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build binaries
+    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.release.tag_name, 'rootfs-')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: resolve version
+        id: v
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'release') {
+            # Strip a leading v so `hawser version` reports 0.1.0, not v0.1.0.
+            $tag = '${{ github.event.release.tag_name }}'
+            $version = $tag -replace '^v', ''
+          } else {
+            $version = '${{ inputs.version }}'
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "building version $version"
+
+      - name: build
+        shell: pwsh
+        env:
+          CGO_ENABLED: '0'
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          # -trimpath keeps absolute build paths out of the binary, so the same
+          # source produces the same bytes on a different machine.
+          foreach ($arch in @('amd64', 'arm64')) {
+            $env:GOOS = 'windows'
+            $env:GOARCH = $arch
+            $out = "dist/hawser_${env:VERSION}_windows_$arch/hawser.exe"
+            New-Item -ItemType Directory -Force (Split-Path $out) | Out-Null
+            go build -trimpath -ldflags "-s -w -X main.buildVersion=$env:VERSION" -o $out ./cmd/hawser
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            Copy-Item LICENSE, README.md (Split-Path $out)
+            Write-Host "built $out ($([math]::Round((Get-Item $out).Length/1MB,1)) MB)"
+          }
+
+      - name: verify the version stamp and size budget
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          # The amd64 binary runs on this runner, so the release can assert that
+          # the stamp actually took - a release reporting "dev" is a silent
+          # embarrassment that is easy to ship and awkward to withdraw.
+          #
+          # `hawser version` exits 3 when no engine is installed, which is
+          # exactly the state of a CI runner. GitHub's pwsh shell propagates
+          # $LASTEXITCODE, so that expected 3 would fail this step; the exit
+          # code is therefore checked deliberately rather than inherited.
+          $exe = "dist/hawser_${env:VERSION}_windows_amd64/hawser.exe"
+          $json = & $exe version --json
+          $code = $LASTEXITCODE
+          if ($code -ne 0 -and $code -ne 3) {
+            Write-Host "::error::hawser version exited $code"
+            exit 1
+          }
+          $reported = ($json | ConvertFrom-Json).app
+          if ($reported -ne $env:VERSION) {
+            Write-Host "::error::binary reports version '$reported', expected '$env:VERSION'"
+            exit 1
+          }
+          Write-Host "version stamp OK: $reported (exit $code, 3 = no engine installed)"
+
+          # PLAN section 10 budgets under 15 MB for the Windows-side footprint.
+          # Warn rather than fail: the budget covers the installed footprint, and
+          # a release should not be blocked by a metric this workflow only
+          # partially measures.
+          foreach ($f in Get-ChildItem dist -Recurse -Filter hawser.exe) {
+            $mb = [math]::Round($f.Length/1MB, 2)
+            Write-Host "$($f.FullName): $mb MB"
+            if ($mb -gt 15) { Write-Host "::warning::$($f.Name) is $mb MB, over the 15 MB budget" }
+          }
+          # Explicit, so no stray native exit code from above leaks out.
+          exit 0
+
+      - name: package
+        shell: pwsh
+        run: |
+          Push-Location dist
+          foreach ($dir in Get-ChildItem -Directory) {
+            Compress-Archive -Path "$($dir.Name)/*" -DestinationPath "$($dir.Name).zip" -Force
+            Remove-Item -Recurse -Force $dir.Name
+          }
+          # One checksum file covering every artifact, in the usual format.
+          Get-ChildItem -Filter *.zip | ForEach-Object {
+            $h = (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)"
+          } | Set-Content SHA256SUMS -Encoding ascii
+          Get-Content SHA256SUMS
+          Pop-Location
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hawser-binaries
+          path: dist/
+          retention-days: 14
+
+  # Separated so only this job holds contents: write. The build job compiles
+  # code and must not be able to publish.
+  publish:
+    name: attach to release
+    needs: build
+    if: github.event_name == 'release' && !startsWith(github.event.release.tag_name, 'rootfs-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: hawser-binaries
+          path: dist
+      - name: upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
