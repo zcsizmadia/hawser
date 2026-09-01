@@ -13,6 +13,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out="${1:-$here/out}"
 # shellcheck source=versions.env
 . "$here/versions.env"
+rootfs_version="${ENGINE_VERSION}-${ROOTFS_REVISION}"
 
 mkdir -p "$out"
 work="$(mktemp -d)"
@@ -114,7 +115,7 @@ cp "$here/assemble.Dockerfile" "$ctx/Dockerfile"
 tag="hawser-rootfs:${ENGINE_VERSION}"
 docker build --build-arg "ALPINE_TAG=${ALPINE_BRANCH#v}" -t "$tag" "$ctx"
 
-tarball="$out/hawser-rootfs-${ENGINE_VERSION}.tar.gz"
+tarball="$out/hawser-rootfs-${rootfs_version}.tar.gz"
 echo "==> exporting $tarball"
 # docker export writes the container filesystem with correct ownership and
 # without the pseudo-filesystems, which is exactly what `wsl --import` wants.
@@ -128,7 +129,7 @@ docker rm -f "$cid" >/dev/null
 (cd "$out" && sha256sum "$(basename "$tarball")" > "$(basename "$tarball").sha256")
 
 echo "==> SBOM"
-"$here/sbom.sh" "$here/versions.env" "$out/hawser-rootfs-${ENGINE_VERSION}.spdx.json"
+"$here/sbom.sh" "$here/versions.env" "$out/hawser-rootfs-${rootfs_version}.spdx.json"
 
 ls -la "$out"
 echo "OK"
