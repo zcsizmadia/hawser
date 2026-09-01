@@ -51,15 +51,21 @@ Docker API, existing frontends (Portainer, lazydocker, VS Code) already work aga
 Standard Go project layout — the Go toolchain, not a framework, decides this shape:
 
 ```
-cmd/hawser/     the binary; one entry point, three run modes (CLI, service, tray)
+cmd/hawser/     the CLI — the product; every capability lives here
+cmd/hawserw/    windowless logon launcher (starts the supervisor, no console flash)
+cmd/hawsertray/ optional status-light tray; shells out to the CLI, holds no logic
 internal/       implementation packages, compiler-enforced private to this module
   wsl/          every wsl.exe call, behind an interface so tests run anywhere
-  ...           provision, pipeproxy, engine, doctor, svc, tray as they land
+  ...           provision, pipeproxy, supervise, config, migrate, integrate, tray
 guest/          Linux side: rootfs build scripts, vsock agent
-installer/      winget/scoop/choco manifests, WiX MSI
+docs/           operator docs, e.g. the unattended/auto-logon runner playbook
 test/e2e/       cross-package suite; the only part needing real WSL2
 spike/          throwaway experiments, deleted once their issue closes
 ```
+
+Running unattended (CI runners, build agents) needs a logged-on session, because
+WSL2 cannot start from a Windows service — see
+[docs/auto-logon-runner.md](docs/auto-logon-runner.md).
 
 Two Go conventions worth stating, since they surprise people arriving from other ecosystems:
 **tests live beside the code they test** (`wsl.go` and `wsl_test.go` in the same folder — the

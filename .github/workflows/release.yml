@@ -85,8 +85,13 @@ jobs:
             $outw = "dist/hawser_${env:VERSION}_windows_$arch/hawserw.exe"
             go build -trimpath -ldflags "-s -w -H=windowsgui" -o $outw ./cmd/hawserw
             if ($LASTEXITCODE -ne 0) { exit 1 }
+            # hawsertray is the optional status-light tray (GUI subsystem); it
+            # shells out to hawser.exe for everything.
+            $outt = "dist/hawser_${env:VERSION}_windows_$arch/hawsertray.exe"
+            go build -trimpath -ldflags "-s -w -H=windowsgui" -o $outt ./cmd/hawsertray
+            if ($LASTEXITCODE -ne 0) { exit 1 }
             Copy-Item LICENSE, README.md (Split-Path $out)
-            Write-Host "built $out ($([math]::Round((Get-Item $out).Length/1MB,1)) MB) + hawserw"
+            Write-Host "built $out ($([math]::Round((Get-Item $out).Length/1MB,1)) MB) + hawserw + hawsertray"
           }
 
       - name: verify the version stamp and size budget

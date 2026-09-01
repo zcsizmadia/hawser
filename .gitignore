@@ -10,3 +10,5 @@ go.work
 go.work.sum
 engine-bin/
 /agent
+/hawsertray
+/hawsertray.exe
