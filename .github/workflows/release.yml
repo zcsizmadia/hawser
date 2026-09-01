@@ -12,6 +12,18 @@ name: release
 on:
   release:
     types: [published]
+
+  # Changes to the release path build immediately, so a mistake here is caught
+  # now rather than discovered while cutting a release. This also makes GitHub
+  # ingest the file at all: a workflow triggered only by release/dispatch is
+  # never parsed until one of those fires, so it stays invisible to
+  # `workflow_dispatch` — which is exactly what happened on the first attempt.
+  push:
+    branches: [main]
+    paths: ['.github/workflows/release.yml']
+  pull_request:
+    paths: ['.github/workflows/release.yml']
+
   # Lets the whole build be exercised without publishing anything.
   workflow_dispatch:
     inputs:
@@ -26,7 +38,7 @@ permissions:
 jobs:
   build:
     name: build binaries
-    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.release.tag_name, 'rootfs-')
+    if: github.event_name != 'release' || !startsWith(github.event.release.tag_name, 'rootfs-')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,8 +55,11 @@ jobs:
             # Strip a leading v so `hawser version` reports 0.1.0, not v0.1.0.
             $tag = '${{ github.event.release.tag_name }}'
             $version = $tag -replace '^v', ''
-          } else {
+          } elseif ('${{ inputs.version }}') {
             $version = '${{ inputs.version }}'
+          } else {
+            # push / pull_request: a validation build, not a release.
+            $version = '0.0.0-ci'
           }
           "version=$version" >> $env:GITHUB_OUTPUT
           Write-Host "building version $version"
