@@ -496,3 +496,47 @@ func TestRewriteUnversionedPath(t *testing.T) {
 		t.Errorf("unversioned path not rewritten: %s", got)
 	}
 }
+
+func TestClientVanishingDuringQuietStreamEndsRelay(t *testing.T) {
+	// The docker-compose /events shape: the engine sends chunked headers and
+	// then nothing (no events happening), and the client exits. The relay is
+	// blocked reading the engine, so only watching the client can notice —
+	// without it, this connection pins the bridge open forever (it held the
+	// idle-stop veto in #41, and leaked silently since v0.1).
+	client, bridgeClient := net.Pipe()
+	engineSide, bridgeEngine := net.Pipe()
+
+	done := make(chan error, 1)
+	go func() { done <- pipeproxy.RewriteBinds(bridgeClient, bridgeEngine) }()
+
+	// Engine: accept the request, answer with a chunked stream that never
+	// sends a chunk.
+	go func() {
+		br := bufio.NewReader(engineSide)
+		http.ReadRequest(br)
+		engineSide.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"))
+		// ...and then silence: no events are happening.
+	}()
+
+	req, _ := http.NewRequest("GET", "http://d/events", nil)
+	if err := req.Write(client); err != nil {
+		t.Fatal(err)
+	}
+	// Read the response head so the stream is established client-side.
+	br := bufio.NewReader(client)
+	if _, err := http.ReadResponse(br, req); err != nil {
+		t.Fatal(err)
+	}
+
+	// The client goes away without ever cancelling politely (process exit).
+	client.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("relay returned %v; a vanished client is ordinary shutdown", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay still pinned open 5s after the client vanished; the #41 idle veto leak")
+	}
+}

@@ -3,6 +3,7 @@ package supervise
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 )
 
@@ -45,16 +46,65 @@ func (c Config) backoffMax() time.Duration {
 	return c.BackoffMax
 }
 
+// Activity reports bridge traffic, for idle detection. pipeproxy.Server
+// implements it.
+type Activity interface {
+	// ActiveConns is how many client connections are open right now.
+	ActiveConns() int
+	// LastActivity is when a connection last opened or closed; the zero time
+	// if there has been none.
+	LastActivity() time.Time
+}
+
 // Supervisor reconciles the engine with the desired state.
 type Supervisor struct {
 	Engine Engine
 	Config Config
 	Log    *slog.Logger
 
+	// Activity feeds idle detection (#41). Nil disables idle stops.
+	Activity Activity
+
+	// IdleTimeout is read every tick, so `hawser config set idle-timeout`
+	// takes effect without a restart. Nil or a zero return disables idle
+	// stops.
+	IdleTimeout func() time.Duration
+
+	// Busy reports whether the engine has running containers. Idle stops
+	// require a definite "no": nil, an error, or true all veto the stop,
+	// because stopping the engine kills whatever runs in it.
+	Busy func(ctx context.Context) (bool, error)
+
+	// mu serializes tick and Demand: a cold start must not race the
+	// reconciler's own view of why the engine is down.
+	mu sync.Mutex
+	// idleStopped mirrors the engine-state file; kept in memory so the tick
+	// can tell "down because I idled it" from "down unexpectedly" without
+	// re-reading, and re-adopted from the file after a supervisor restart.
+	idleStopped bool
+	// upSince anchors the idle clock: a freshly started engine with no
+	// traffic yet must age past the timeout before it can be idled.
+	upSince time.Time
+
+	// lastVeto dedupes the "idle stop deferred" log: one line per reason
+	// streak, so a user asking "why is my engine not idling?" gets an answer
+	// without the log drowning in per-tick repeats.
+	lastVeto string
+
 	// failures counts consecutive start failures, for backoff.
 	failures int
 	// nextTry is the earliest moment another start attempt is allowed.
 	nextTry time.Time
+}
+
+// veto records why an idle stop did not happen, logging only when the reason
+// changes. Caller holds s.mu.
+func (s *Supervisor) veto(reason string, kv ...any) {
+	if s.lastVeto == reason {
+		return
+	}
+	s.lastVeto = reason
+	s.log().Info("idle stop deferred", append([]any{"reason", reason}, kv...)...)
 }
 
 func (s *Supervisor) log() *slog.Logger {
@@ -87,11 +137,29 @@ func (s *Supervisor) Run(ctx context.Context) {
 }
 
 func (s *Supervisor) tick(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	desired := ReadDesired(s.Config.StateDir)
 	up := s.Engine.Running(ctx)
 
 	switch {
 	case desired == DesiredRunning && !up:
+		// Down on purpose? The file is the shared truth: this supervisor may
+		// have idled the engine (idleStopped), or a previous incarnation did
+		// (file says idle after a restart) — either way the engine stays down
+		// until demand. Deleting the file is the wake-up poke (`hawser start`
+		// does it), so a set flag with no file means someone asked.
+		fileIdle := ReadEngineState(s.Config.StateDir) == EngineIdle
+		if fileIdle {
+			s.idleStopped = true
+			return // idle by design; Demand or a poke wakes it
+		}
+		if s.idleStopped {
+			s.log().Info("idle marker removed; waking the engine")
+			s.idleStopped = false
+		}
+
 		if time.Now().Before(s.nextTry) {
 			return // still backing off
 		}
@@ -106,6 +174,7 @@ func (s *Supervisor) tick(ctx context.Context) {
 		}
 		s.failures = 0
 		s.nextTry = time.Time{}
+		s.upSince = time.Now()
 		s.log().Info("engine recovered")
 
 	case desired == DesiredStopped && up:
@@ -113,13 +182,112 @@ func (s *Supervisor) tick(ctx context.Context) {
 		if err := s.Engine.Stop(ctx); err != nil {
 			s.log().Error("engine stop failed", "error", err)
 		}
+		s.idleStopped = false
+		WriteEngineState(s.Config.StateDir, EngineActive)
 
 	case desired == DesiredRunning && up:
 		// Healthy: a success observed by the loop also resets backoff, so one
 		// bad patch (a WSL update mid-flight, say) does not tax the next.
 		s.failures = 0
 		s.nextTry = time.Time{}
+		if s.upSince.IsZero() {
+			s.upSince = time.Now()
+		}
+		// A running engine can't be idle-stopped state; clear a stale marker
+		// (someone started the engine by hand while the file said idle).
+		if s.idleStopped || ReadEngineState(s.Config.StateDir) == EngineIdle {
+			s.idleStopped = false
+			WriteEngineState(s.Config.StateDir, EngineActive)
+		}
+		s.maybeIdleStop(ctx)
 	}
+}
+
+// maybeIdleStop stops a healthy engine that nothing is using, returning its
+// RAM to the machine (#41). Caller holds s.mu.
+func (s *Supervisor) maybeIdleStop(ctx context.Context) {
+	if s.Activity == nil || s.IdleTimeout == nil {
+		return
+	}
+	timeout := s.IdleTimeout()
+	if timeout <= 0 {
+		s.lastVeto = ""
+		return // idle stops are off (the default)
+	}
+	if n := s.Activity.ActiveConns(); n > 0 {
+		s.veto("open client connections", "conns", n)
+		return
+	}
+	// The idle clock starts at whichever is later: the last connection, or
+	// the engine coming up — a fresh engine with no traffic yet still gets
+	// its full timeout.
+	quietSince := s.Activity.LastActivity()
+	if s.upSince.After(quietSince) {
+		quietSince = s.upSince
+	}
+	if time.Since(quietSince) < timeout {
+		s.veto("waiting out the quiet window",
+			"quiet", time.Since(quietSince).Round(time.Second), "idleTimeout", timeout)
+		return
+	}
+	// Stopping the engine kills whatever runs in it, so idling requires a
+	// definite "nothing is running": no probe, a probe error, or running
+	// containers all veto.
+	if s.Busy == nil {
+		s.veto("no container probe wired")
+		return
+	}
+	busy, err := s.Busy(ctx)
+	if err != nil {
+		s.veto("container probe failed", "error", err)
+		return
+	}
+	if busy {
+		s.veto("containers are running")
+		return
+	}
+	s.lastVeto = ""
+
+	s.log().Info("bridge quiet and no containers running; stopping the engine until demand",
+		"quiet", time.Since(quietSince).Round(time.Second), "idleTimeout", timeout)
+	if err := WriteEngineState(s.Config.StateDir, EngineIdle); err != nil {
+		s.log().Error("could not record the idle state; leaving the engine running", "error", err)
+		return
+	}
+	if err := s.Engine.Stop(ctx); err != nil {
+		s.log().Error("idle stop failed", "error", err)
+		WriteEngineState(s.Config.StateDir, EngineActive)
+		return
+	}
+	s.idleStopped = true
+}
+
+// Demand wakes an idle-stopped engine for an incoming connection, blocking
+// until it is up; a no-op when the engine is not idle. The pipe server's
+// dialer calls this before every engine dial, so the first `docker` command
+// after an idle stop cold-starts the engine transparently.
+func (s *Supervisor) Demand(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.idleStopped && ReadEngineState(s.Config.StateDir) != EngineIdle {
+		return nil
+	}
+	s.log().Info("connection while idle; cold-starting the engine")
+	began := time.Now()
+	if err := s.Engine.Start(ctx); err != nil {
+		s.log().Error("cold start failed", "error", err)
+		return err
+	}
+	// Cleared only after a successful start, so a second connection arriving
+	// mid-start blocks on the mutex and then sees a running engine, rather
+	// than racing ahead to dial an engine that is not up yet.
+	s.idleStopped = false
+	WriteEngineState(s.Config.StateDir, EngineActive)
+	s.upSince = time.Now()
+	// Measured, not assumed: the issue asked for the real cold-start number.
+	s.log().Info("engine cold-started on demand", "took", time.Since(began).Round(10*time.Millisecond))
+	return nil
 }
 
 // backoff is exponential from 2s, capped: crash loops must not hammer WSL,

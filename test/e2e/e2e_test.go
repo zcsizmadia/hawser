@@ -18,6 +18,7 @@
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -79,6 +80,7 @@ func TestAcceptance(t *testing.T) {
 		{"ExecInRunningContainer", stageExec},
 		{"LogsFollowStreams", stageLogsFollow},
 		{"ComposeStack", stageCompose},
+		{"IdleStopAndOnDemandWake", stageIdle},
 		{"InterruptedClientDoesNotWedgeBridge", stageInterrupt},
 		{"VsockPathServedEverything", stageVsockServed},
 		{"Uninstall", stageUninstall},
@@ -214,15 +216,19 @@ func stageProxy(t *testing.T, s *state) {
 	}
 	s.proxyLog = f
 
-	// The suite's own pipe, so a Hawser or Docker Desktop already on the
-	// machine is neither disturbed nor accidentally tested.
-	s.proxy = exec.Command(s.hawser, "proxy",
+	// The bridge is `hawser supervise`, not `hawser proxy`: it is what real
+	// installs run (autostart launches it), and it is where the idle/on-demand
+	// behavior the IdleStop stage exercises lives. The suite's own pipe and
+	// state dir keep a Hawser or Docker Desktop already on the machine
+	// undisturbed — the state dir also scopes the supervisor's single-instance
+	// mutex, so a real supervisor can coexist with the suite's.
+	s.proxy = exec.Command(s.hawser, "supervise",
 		"--distro", distro, "--state-dir", s.stateDir,
 		"--pipe", pipeName, "--no-context")
 	s.proxy.Stdout = f
 	s.proxy.Stderr = f
 	if err := s.proxy.Start(); err != nil {
-		t.Fatalf("starting proxy: %v", err)
+		t.Fatalf("starting supervisor: %v", err)
 	}
 
 	// Up when the engine answers, not when the process exists.
@@ -390,6 +396,71 @@ services:
 	}
 	if !strings.Contains(string(got), "compose-ran") {
 		t.Errorf("output.txt = %q", got)
+	}
+}
+
+func stageIdle(t *testing.T, s *state) {
+	// The #41 story end to end: configure a short idle timeout, watch the
+	// supervisor stop the quiet engine (status says idle, exit 0 — "stopped
+	// by design" is not an error), then have one docker command wake it.
+	out, err := run(t, 30*time.Second, s.hawser, "config",
+		"--state-dir", s.stateDir, "set", "idle-timeout", "15s")
+	must(t, out, err, "hawser config set idle-timeout")
+	defer func() {
+		out, err := run(t, 30*time.Second, s.hawser, "config",
+			"--state-dir", s.stateDir, "set", "idle-timeout", "off")
+		must(t, out, err, "hawser config set idle-timeout off")
+	}()
+
+	statusJSON := func() (engine string, exit int) {
+		t.Helper()
+		out, err := run(t, 30*time.Second, s.hawser, "status", "--state-dir", s.stateDir, "--json")
+		if err != nil {
+			return "", 1
+		}
+		var st struct {
+			Engine string `json:"engine"`
+		}
+		if jerr := json.Unmarshal([]byte(out), &st); jerr != nil {
+			t.Fatalf("status --json unparseable: %v\n%s", jerr, out)
+		}
+		return st.Engine, 0
+	}
+
+	// Idle within: 15s quiet + a few 3s ticks + the stop itself.
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		engine, _ := statusJSON()
+		if engine == "idle" {
+			break
+		}
+		if time.Now().After(deadline) {
+			// The supervisor logs why each idle stop was deferred; that tail
+			// is the diagnosis.
+			logBytes, _ := os.ReadFile(filepath.Join(s.stateDir, "proxy-e2e.log"))
+			tail := string(logBytes)
+			if len(tail) > 4000 {
+				tail = tail[len(tail)-4000:]
+			}
+			t.Fatalf("engine did not idle-stop within 90s; status reports %q\nsupervisor log tail:\n%s", engine, tail)
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Log("engine idle-stopped; status reports it as such")
+
+	// `hawser status` must treat idle as healthy: exit 0.
+	if out, err := run(t, 30*time.Second, s.hawser, "status", "--state-dir", s.stateDir); err != nil {
+		t.Errorf("status exited non-zero on an idle engine (stopped by design is not broken):\n%s", out)
+	}
+
+	// One docker command is the wake-up: it pays the cold start and works.
+	began := time.Now()
+	out, err = dockerE(t, s, 2*time.Minute, "version", "--format", "{{.Server.Version}}")
+	must(t, out, err, "docker version against an idle engine")
+	t.Logf("cold start: docker version answered %q in %s", out, time.Since(began).Round(100*time.Millisecond))
+
+	if engine, _ := statusJSON(); engine != "running" {
+		t.Errorf("engine is %q after the on-demand wake, want running", engine)
 	}
 }
 

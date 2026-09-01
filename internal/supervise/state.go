@@ -59,3 +59,57 @@ func WriteDesired(stateDir string, d Desired) error {
 	}
 	return nil
 }
+
+// EngineState is the supervisor's own record of *why* the engine is down —
+// distinct from Desired, which is what the user asked for. Its one non-default
+// value, idle, is what lets `hawser status` (and scripts) tell "stopped by
+// design, will wake on demand" from "broken".
+type EngineState string
+
+const (
+	// EngineActive is the normal state; represented by the file being absent.
+	EngineActive EngineState = "active"
+	// EngineIdle means the supervisor stopped the engine because the bridge
+	// was quiet for the configured idle-timeout. Deleting the file is the
+	// wake-up poke: the supervisor treats its disappearance as demand.
+	EngineIdle EngineState = "idle"
+)
+
+func engineStatePath(stateDir string) string {
+	return filepath.Join(stateDir, "engine-state")
+}
+
+// ReadEngineState returns the recorded state; absent or unreadable is active.
+func ReadEngineState(stateDir string) EngineState {
+	b, err := os.ReadFile(engineStatePath(stateDir))
+	if err != nil {
+		return EngineActive
+	}
+	if EngineState(strings.TrimSpace(string(b))) == EngineIdle {
+		return EngineIdle
+	}
+	return EngineActive
+}
+
+// WriteEngineState records the state atomically; writing active removes the
+// file, so absence stays the ground truth for the normal case.
+func WriteEngineState(stateDir string, st EngineState) error {
+	if st == EngineActive {
+		err := os.Remove(engineStatePath(stateDir))
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return fmt.Errorf("creating state dir: %w", err)
+	}
+	tmp := engineStatePath(stateDir) + ".tmp"
+	if err := os.WriteFile(tmp, []byte(st+"\n"), 0o644); err != nil {
+		return fmt.Errorf("writing engine state: %w", err)
+	}
+	if err := os.Rename(tmp, engineStatePath(stateDir)); err != nil {
+		return fmt.Errorf("committing engine state: %w", err)
+	}
+	return nil
+}
