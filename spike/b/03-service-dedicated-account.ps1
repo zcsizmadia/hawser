@@ -1,19 +1,34 @@
-# Spike B step 3: dedicated service account, with the distro imported AS that
-# account.
+# Spike B step 3: dedicated service account that provisions its own distro.
 #
-# This is the pattern PLAN §09 proposes, and the one most likely to work: if WSL
-# registration is per-user, then the account that runs the service must be the
-# account that owns the distro. Importing as another user is done through a
-# scheduled task, which is the only built-in way to run a command as a local
-# account non-interactively.
+# The pattern PLAN §09 proposes, and after step 02 the only one left: WSL refuses
+# to run as LocalSystem outright (WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED), so a real
+# account is the only remaining option.
+#
+# The service imports the distro itself rather than having something else import
+# it beforehand. Two reasons: WSL registration is per-user, so the account that
+# runs the service must be the account that owns the distro; and running
+# `wsl --import` as another account from outside needs stored-credential rights
+# a bare service account does not have (schtasks fails with "A specified logon
+# session does not exist"). Self-import is also what `hawser install --headless`
+# would have to do in production, so it is the more useful thing to measure.
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $svc = 'HawserSpikeB'
 $user = 'hawser-svc'
-$distro = 'hawser-spike-b'
+$distro = 'hawser-spike-b-svc'
 $exe = Join-Path $here 'agent\probe.exe'
+$dataRoot = 'C:\ProgramData\hawser-spike-b'
 
 if (-not (Test-Path $exe)) { throw "run 01-preflight.ps1 first (probe.exe missing)" }
+
+function Assert-Admin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if (-not ([Security.Principal.WindowsPrincipal]::new($id)).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "run this from an elevated PowerShell"
+    }
+}
+Assert-Admin
 
 # Generated locally, used only for these API calls, never printed or written to
 # disk. A real installer would use a virtual service account or a managed one.
@@ -23,8 +38,8 @@ function New-RandomPassword {
     # absent under PowerShell 7 (.NET Core). RandomNumberGenerator::Create()
     # exists on both, so this works in 5.1 and 7 alike.
     #
-    # Symbols are restricted to ones that survive sc.exe and schtasks argument
-    # parsing unscathed - no quotes, ampersands, carets or percent signs.
+    # Symbols are restricted to ones that survive sc.exe argument parsing
+    # unscathed - no quotes, ampersands, carets or percent signs.
     $sets = @(
         'ABCDEFGHIJKLMNPQRSTUVWXYZ',
         'abcdefghijkmnopqrstuvwxyz',
@@ -45,10 +60,40 @@ function New-RandomPassword {
         $chars = foreach ($s in $sets) { & $pick $s }
         $all = -join $sets
         $chars += 1..($Length - $sets.Count) | ForEach-Object { & $pick $all }
-        # Shuffle, so the guaranteed characters are not always in front.
         -join ($chars | Sort-Object { & $pick '0123456789' })
     } finally {
         $rng.Dispose()
+    }
+}
+
+function Grant-UserRight {
+    param([string]$Account, [string]$Right)
+    # No PowerShell cmdlet exposes user rights, so secedit is the built-in path.
+    $tmp = Join-Path $env:TEMP "secpol-$PID-$Right"
+    New-Item -ItemType Directory -Force $tmp | Out-Null
+    try {
+        $inf = Join-Path $tmp 'export.inf'
+        $db = Join-Path $tmp 'secedit.sdb'
+        secedit /export /cfg $inf /quiet
+
+        $sid = (Get-LocalUser $Account).SID.Value
+        $content = Get-Content $inf
+        $line = $content | Where-Object { $_ -match "^$Right\s*=" }
+        if ($line) {
+            if ($line -match [regex]::Escape($sid)) {
+                Write-Host "  $Right already granted" -ForegroundColor DarkGray
+                return
+            }
+            $content = $content -replace [regex]::Escape($line), "$line,*$sid"
+        } else {
+            $content = $content -replace '(\[Privilege Rights\])', "`$1`r`n$Right = *$sid"
+        }
+        $applied = Join-Path $tmp 'apply.inf'
+        $content | Set-Content $applied -Encoding Unicode
+        secedit /configure /db $db /cfg $applied /areas USER_RIGHTS /quiet
+        Write-Host "  granted $Right" -ForegroundColor Green
+    } finally {
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -59,110 +104,55 @@ if (-not (Get-LocalUser $user -ErrorAction SilentlyContinue)) {
     Write-Host "== creating local account $user ==" -ForegroundColor Cyan
     New-LocalUser -Name $user -Password $sec -PasswordNeverExpires `
         -AccountNeverExpires -Description "Hawser Spike B service account" | Out-Null
-    # Not added to any group beyond Users: least privilege is part of the test.
+    # Deliberately not added to Administrators: whether least privilege
+    # suffices is part of what is being measured.
 } else {
     Write-Host "== resetting password for existing $user ==" -ForegroundColor Yellow
     Set-LocalUser -Name $user -Password $sec
 }
 
-function Grant-ServiceLogonRight([string]$account) {
-    # No PowerShell cmdlet exposes user rights, so secedit is the built-in path.
-    $tmp = Join-Path $env:TEMP "secpol-$PID"
-    New-Item -ItemType Directory -Force $tmp | Out-Null
-    $inf = Join-Path $tmp 'export.inf'
-    $db = Join-Path $tmp 'secedit.sdb'
-    secedit /export /cfg $inf /quiet
+Write-Host "== granting user rights ==" -ForegroundColor Cyan
+Grant-UserRight -Account $user -Right 'SeServiceLogonRight'
 
-    $sid = (Get-LocalUser $account).SID.Value
-    $content = Get-Content $inf
-    $line = $content | Where-Object { $_ -match '^SeServiceLogonRight' }
-    if ($line) {
-        if ($line -match [regex]::Escape($sid)) {
-            Write-Host "  already granted" -ForegroundColor DarkGray
-            Remove-Item $tmp -Recurse -Force
-            return
-        }
-        $new = "$line,*$sid"
-        $content = $content -replace [regex]::Escape($line), $new
-    } else {
-        $content = $content -replace '(\[Privilege Rights\])', "`$1`r`nSeServiceLogonRight = *$sid"
-    }
-    $applied = Join-Path $tmp 'apply.inf'
-    $content | Set-Content $applied -Encoding Unicode
-    secedit /configure /db $db /cfg $applied /areas USER_RIGHTS /quiet
-    Remove-Item $tmp -Recurse -Force
-    Write-Host "  granted SeServiceLogonRight" -ForegroundColor Green
-}
-
-Write-Host "== granting 'log on as a service' ==" -ForegroundColor Cyan
-Grant-ServiceLogonRight $user
-
-# The distro must be registered under the service account's own hive, so the
-# import runs as that account via a one-shot scheduled task.
-Write-Host "`n== importing $distro as $user (via scheduled task) ==" -ForegroundColor Cyan
-$dl = Join-Path (Split-Path $here -Parent) 'a\dl'
-$alpine = Join-Path $dl 'alpine-minirootfs-3.24.1-x86_64.tar.gz'
-$docker = Join-Path $dl 'docker-29.7.2.tgz'
-$setupSh = Join-Path (Split-Path $here -Parent) 'a\03-setup.sh'
-$svcDistro = "$distro-svc"
-$vhd = "C:\ProgramData\hawser-spike-b\$svcDistro"
-
-# The account needs to reach these files, so stage them somewhere readable and
-# grant the account access to its own VHDX directory.
+# Stage the rootfs somewhere the account can read, and give it a writable place
+# for the VHDX. Without this the import fails on permissions rather than on the
+# question the spike is asking.
+Write-Host "`n== staging rootfs for $user ==" -ForegroundColor Cyan
+$rootfsSrc = Join-Path (Split-Path $here -Parent) 'a\dl\alpine-minirootfs-3.24.1-x86_64.tar.gz'
+if (-not (Test-Path $rootfsSrc)) { throw "rootfs not found at $rootfsSrc - run 01-preflight.ps1 first" }
+New-Item -ItemType Directory -Force $dataRoot | Out-Null
+$rootfs = Join-Path $dataRoot 'rootfs.tar.gz'
+Copy-Item $rootfsSrc $rootfs -Force
+$vhd = Join-Path $dataRoot $distro
 New-Item -ItemType Directory -Force $vhd | Out-Null
-icacls "C:\ProgramData\hawser-spike-b" /grant "${user}:(OI)(CI)F" /T | Out-Null
-
-$importScript = Join-Path $env:TEMP "hawser-spike-import-$PID.ps1"
-@"
-`$ErrorActionPreference = 'Continue'
-`$log = 'C:\ProgramData\hawser-spike-b\import.log'
-"whoami: `$(whoami)" | Out-File `$log -Append
-"session: `$((Get-Process -Id `$PID).SessionId)" | Out-File `$log -Append
-"distros before:" | Out-File `$log -Append
-(wsl --list --verbose) -replace "``0","" | Out-File `$log -Append
-wsl --import $svcDistro '$vhd' '$alpine' --version 2 2>&1 | Out-File `$log -Append
-"import exit: `$LASTEXITCODE" | Out-File `$log -Append
-`$p = (wsl -d $svcDistro --exec wslpath -a '$setupSh')
-`$t = (wsl -d $svcDistro --exec wslpath -a '$docker')
-wsl -d $svcDistro -u root --exec sh `$p.Trim() `$t.Trim() 2>&1 | Out-File `$log -Append
-"setup exit: `$LASTEXITCODE" | Out-File `$log -Append
-"distros after:" | Out-File `$log -Append
-(wsl --list --verbose) -replace "``0","" | Out-File `$log -Append
-"@ | Set-Content $importScript -Encoding UTF8
-
-$taskName = 'HawserSpikeBImport'
-schtasks /Delete /TN $taskName /F 2>$null | Out-Null
-schtasks /Create /TN $taskName /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$importScript`"" `
-    /SC ONCE /ST 23:59 /RU $user /RP $pw /RL LIMITED /F | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "schtasks create failed (account may lack batch logon right)" }
-schtasks /Run /TN $taskName | Out-Null
-
-Write-Host "waiting for import (up to 3 min)..." -ForegroundColor DarkGray
-$deadline = (Get-Date).AddMinutes(3)
-do {
-    Start-Sleep -Seconds 5
-    $state = (schtasks /Query /TN $taskName /FO LIST | Select-String 'Status:').ToString()
-} while ($state -match 'Running' -and (Get-Date) -lt $deadline)
-
-Write-Host "`n== import log (as $user) ==" -ForegroundColor Cyan
-Get-Content 'C:\ProgramData\hawser-spike-b\import.log' -ErrorAction SilentlyContinue | Select-Object -Last 30
+icacls $dataRoot /grant "${user}:(OI)(CI)F" /T | Out-Null
+Write-Host "  rootfs at $rootfs, VHDX dir $vhd, both writable by $user" -ForegroundColor Green
 
 Write-Host "`n== creating $svc under $user ==" -ForegroundColor Cyan
 if (Get-Service $svc -ErrorAction SilentlyContinue) {
-    sc.exe stop $svc | Out-Null; Start-Sleep -Seconds 2; sc.exe delete $svc | Out-Null; Start-Sleep -Seconds 1
+    sc.exe stop $svc | Out-Null
+    Start-Sleep -Seconds 2
+    sc.exe delete $svc | Out-Null
+    Start-Sleep -Seconds 1
 }
-# HAWSER_SPIKE_DISTRO defaults to hawser-spike-b, but the service account owns
-# hawser-spike-b-svc, so point the service at that one via the registry.
-sc.exe create $svc binPath= "`"$exe`"" start= demand obj= ".\$user" password= "$pw" DisplayName= "Hawser Spike B (dedicated account)" | Out-Null
+sc.exe create $svc binPath= "`"$exe`"" start= demand obj= ".\$user" password= "$pw" `
+    DisplayName= "Hawser Spike B (dedicated account)" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "sc create failed" }
+
+# The probe reads these; HAWSER_SPIKE_ROOTFS is what tells it to self-import.
 $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$svc"
-Set-ItemProperty $key -Name Environment -Value @("HAWSER_SPIKE_DISTRO=$svcDistro") -Type MultiString
+Set-ItemProperty $key -Name Environment -Type MultiString -Value @(
+    "HAWSER_SPIKE_DISTRO=$distro",
+    "HAWSER_SPIKE_ROOTFS=$rootfs",
+    "HAWSER_SPIKE_VHD=$vhd"
+)
 
 $pw = $null  # drop it from this session
 
 Write-Host "`n== starting ==" -ForegroundColor Cyan
 sc.exe start $svc
-Start-Sleep -Seconds 30
+Write-Host "waiting for the import and engine start (up to 2 min)..." -ForegroundColor DarkGray
+Start-Sleep -Seconds 45
 sc.exe query $svc | Select-String "STATE|WIN32_EXIT_CODE"
 
 Write-Host "`n== probe log ==" -ForegroundColor Cyan
@@ -170,9 +160,17 @@ Write-Host "`n== probe log ==" -ForegroundColor Cyan
 
 Write-Host @"
 
-If 'distro-visible' and 'socket-up' are both ok=true here, the dedicated-account
-pattern works and the CI claim holds. Then run 04 to prove it survives with
-nobody logged in - that is the part that actually matters.
+The decisive lines:
+
+  self-import-result          can a session-0 service account register a distro?
+  distro-visible-after-import does it then see it?
+  socket-up                   does dockerd start under that account?
+
+All three ok -> the dedicated-account pattern works. Run 04 to test the
+no-login window, which is the part that actually matters.
+
+Any of them failing -> session-0 operation is not achievable on this WSL.
+That is a NO-GO for PLAN section 06's headline claim, and worth knowing now.
 
 Next: .\04-nologin-window.ps1
 "@ -ForegroundColor Green

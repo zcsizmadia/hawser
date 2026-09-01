@@ -123,6 +123,20 @@ func probe() {
 	d := distro()
 	visible := err == nil && strings.Contains(out, d)
 	logEvent(event{Phase: "distro-visible", Detail: d, OK: boolp(visible)})
+
+	// Registration is per-user, so a service account will not see a distro the
+	// interactive user imported. Rather than importing it from outside (which
+	// needs stored-credential rights the account does not have), the service
+	// imports its own — which is also what `hawser install --headless` would
+	// have to do in production, so it is the more useful thing to measure.
+	if !visible && os.Getenv("HAWSER_SPIKE_ROOTFS") != "" {
+		visible = selfImport(d)
+		out, err = run("wsl.exe", "--list", "--verbose")
+		logEvent(event{Phase: "distro-visible-after-import", Detail: d,
+			Output: out, OK: boolp(err == nil && strings.Contains(out, d))})
+		visible = err == nil && strings.Contains(out, d)
+	}
+
 	if !visible {
 		// Distinguish the causes rather than assuming one. The first run of
 		// this spike hit WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED under LocalSystem,
@@ -171,6 +185,31 @@ func probe() {
 	}
 	out, _ = run("wsl.exe", "-d", d, "-u", "root", "--exec", "tail", "-30", "/var/log/dockerd.log")
 	logEvent(event{Phase: "socket-up", Output: out, OK: boolp(false)})
+}
+
+// selfImport registers the distro under the account this process runs as.
+//
+// This is the decisive measurement of the spike: whether a non-interactive
+// service account in session 0 can provision a WSL distro at all. If it can,
+// the dedicated-account pattern works and `hawser install --headless` knows
+// what it has to do; if it cannot, session-0 operation is off the table.
+func selfImport(d string) bool {
+	rootfs := os.Getenv("HAWSER_SPIKE_ROOTFS")
+	vhd := os.Getenv("HAWSER_SPIKE_VHD")
+	if vhd == "" {
+		vhd = filepath.Join(logDir, d)
+	}
+	if err := os.MkdirAll(vhd, 0o755); err != nil {
+		logEvent(event{Phase: "self-import", Err: err.Error(), OK: boolp(false),
+			Detail: "could not create the VHDX directory"})
+		return false
+	}
+
+	logEvent(event{Phase: "self-import", Detail: "importing " + d + " from " + rootfs})
+	out, err := run("wsl.exe", "--import", d, vhd, rootfs, "--version", "2")
+	logEvent(event{Phase: "self-import-result", Output: out, Err: errString(err),
+		OK: boolp(err == nil)})
+	return err == nil
 }
 
 // heartbeat records socket health until told to stop. Reading these lines after
