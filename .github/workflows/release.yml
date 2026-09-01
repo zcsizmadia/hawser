@@ -159,7 +159,10 @@ jobs:
         with:
           name: hawser-binaries
           path: dist
+      # --repo is required: this job downloads artifacts without checking out
+      # the code, so gh has no git remote to infer the repository from and
+      # fails with "not a git repository".
       - name: upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber --repo "${{ github.repository }}"
