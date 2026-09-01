@@ -80,8 +80,13 @@ jobs:
             New-Item -ItemType Directory -Force (Split-Path $out) | Out-Null
             go build -trimpath -ldflags "-s -w -X main.buildVersion=$env:VERSION" -o $out ./cmd/hawser
             if ($LASTEXITCODE -ne 0) { exit 1 }
+            # hawserw is the windowless logon launcher (GUI subsystem, so no
+            # console flashes at startup); autostart refuses without it.
+            $outw = "dist/hawser_${env:VERSION}_windows_$arch/hawserw.exe"
+            go build -trimpath -ldflags "-s -w -H=windowsgui" -o $outw ./cmd/hawserw
+            if ($LASTEXITCODE -ne 0) { exit 1 }
             Copy-Item LICENSE, README.md (Split-Path $out)
-            Write-Host "built $out ($([math]::Round((Get-Item $out).Length/1MB,1)) MB)"
+            Write-Host "built $out ($([math]::Round((Get-Item $out).Length/1MB,1)) MB) + hawserw"
           }
 
       - name: verify the version stamp and size budget

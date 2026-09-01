@@ -94,7 +94,10 @@ flags:
 		return exitError
 	}
 	defer logFile.Close()
-	log := slog.New(slog.NewTextHandler(io.MultiWriter(logFile, os.Stderr), nil))
+	// Warn+ mirrors to the Event Log for admins; the file keeps everything.
+	log := slog.New(logging.NewEventLogHandler(
+		slog.NewTextHandler(io.MultiWriter(logFile, os.Stderr), nil),
+		logging.EventSource))
 
 	p := &provision.Provisioner{Logger: log}
 	targetDistro, ok := resolveDistro(p, opts)
