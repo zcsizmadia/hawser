@@ -101,10 +101,7 @@ flags:
 	}
 
 	srv := &pipeproxy.Server{
-		Dialer: &pipeproxy.WSLDialer{
-			Distro:     targetDistro,
-			SocketPath: *socketPath,
-		},
+		Dialer: engineDialer(targetDistro, *socketPath, log),
 		Logger: log,
 	}
 	if !*noRewrite {

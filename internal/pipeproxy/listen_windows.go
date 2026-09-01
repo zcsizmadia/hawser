@@ -7,6 +7,7 @@ import (
 	"net"
 
 	"github.com/Microsoft/go-winio"
+	"golang.org/x/sys/windows"
 )
 
 // DefaultPipeName is what stock docker.exe connects to when DOCKER_HOST is
@@ -56,7 +57,12 @@ func Listen(pipeName, sddl string) (net.Listener, error) {
 }
 
 func init() {
-	// What a winio pipe returns when the relay closes its other direction —
-	// ordinary shutdown, not a fault worth logging.
-	platformClosedErrors = append(platformClosedErrors, winio.ErrFileClosed)
+	// Ordinary shutdown shapes on Windows, not faults worth logging:
+	// winio.ErrFileClosed is what a winio pipe returns when the relay closes
+	// its other direction; ERROR_BROKEN_PIPE ("the pipe has been ended") and
+	// ERROR_NO_DATA ("the pipe is being closed") are what a pipe or hvsock
+	// read/write returns when the peer went away abruptly — the normal end of
+	// a docker CLI that exits mid-connection.
+	platformClosedErrors = append(platformClosedErrors,
+		winio.ErrFileClosed, windows.ERROR_BROKEN_PIPE, windows.ERROR_NO_DATA)
 }

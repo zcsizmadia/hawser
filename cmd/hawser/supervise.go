@@ -136,7 +136,7 @@ flags:
 
 	// ...while the pipe server carries traffic. Both stop together.
 	srv := &pipeproxy.Server{
-		Dialer:  &pipeproxy.WSLDialer{Distro: targetDistro},
+		Dialer:  engineDialer(targetDistro, "", log),
 		Logger:  log,
 		Handler: pipeproxy.RewriteBinds,
 	}
