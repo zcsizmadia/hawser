@@ -1,0 +1,154 @@
+package release_test
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/zcsizmadia/hawser/internal/release"
+)
+
+func TestEmbeddedManifestIsValid(t *testing.T) {
+	// The manifest is hand-edited alongside guest/rootfs/versions.env, so a
+	// typo must fail the build's tests rather than a user's install.
+	m, err := release.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(m.Engines) == 0 {
+		t.Fatal("no engines in the embedded manifest")
+	}
+
+	defaults := 0
+	for _, e := range m.Engines {
+		if e.Default {
+			defaults++
+		}
+		if e.Version == "" {
+			t.Error("an engine entry has no version")
+		}
+		if e.Rootfs.URL == "" {
+			t.Errorf("engine %s has no rootfs URL", e.Version)
+		}
+		// A digest, when present, must be a full SHA-256.
+		if e.Rootfs.SHA256 != "" && len(e.Rootfs.SHA256) != 64 {
+			t.Errorf("engine %s has a malformed sha256 (%d chars)", e.Version, len(e.Rootfs.SHA256))
+		}
+		for _, c := range []string{"dockerd", "containerd", "runc", "buildkit"} {
+			if e.Components[c] == "" {
+				t.Errorf("engine %s does not record the %s version", e.Version, c)
+			}
+		}
+	}
+	if defaults != 1 {
+		t.Errorf("%d engines marked default, want exactly 1", defaults)
+	}
+}
+
+func TestEmbeddedManifestMatchesRootfsPins(t *testing.T) {
+	// The manifest and the rootfs build must agree, or `hawser version` would
+	// report components the installed rootfs does not contain.
+	m, err := release.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	e, err := m.Engine("")
+	if err != nil {
+		t.Fatalf("default engine: %v", err)
+	}
+
+	pins := readVersionsEnv(t)
+	if pins["ENGINE_VERSION"] != e.Version {
+		t.Errorf("manifest engine %s != versions.env ENGINE_VERSION %s",
+			e.Version, pins["ENGINE_VERSION"])
+	}
+	for envKey, component := range map[string]string{
+		"CONTAINERD_VERSION":    "containerd",
+		"RUNC_VERSION":          "runc",
+		"BUILDKIT_VERSION":      "buildkit",
+		"ALPINE_ROOTFS_VERSION": "alpine",
+	} {
+		want := strings.TrimPrefix(pins[envKey], "v")
+		if want == "" {
+			t.Fatalf("versions.env has no %s", envKey)
+		}
+		if got := e.Components[component]; got != want {
+			t.Errorf("manifest %s = %q, versions.env %s = %q", component, got, envKey, want)
+		}
+	}
+}
+
+func TestEngineSelectionIsExact(t *testing.T) {
+	// A pin that quietly resolves to something else is not a pin.
+	m, err := release.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	def, err := m.Engine("")
+	if err != nil {
+		t.Fatalf("default: %v", err)
+	}
+
+	if _, err := m.Engine(def.Version); err != nil {
+		t.Errorf("exact version %q not found: %v", def.Version, err)
+	}
+
+	// A truncated prefix of a real version must not match it.
+	prefix := def.Version[:len(def.Version)-2]
+	if _, err := m.Engine(prefix); err == nil {
+		t.Errorf("prefix %q resolved to an engine; selection must be exact", prefix)
+	}
+}
+
+func TestEngineUnknownVersionListsChoices(t *testing.T) {
+	m, err := release.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	_, err = m.Engine("99.0.0")
+	if err == nil {
+		t.Fatal("unknown version succeeded")
+	}
+	// The error has to say what IS available, or the user is left guessing.
+	for _, v := range m.Versions() {
+		if !strings.Contains(err.Error(), v) {
+			t.Errorf("error %q does not list available version %q", err, v)
+		}
+	}
+}
+
+func TestPublishedRequiresBothURLAndChecksum(t *testing.T) {
+	cases := []struct {
+		name string
+		r    release.Rootfs
+		want bool
+	}{
+		{"both present", release.Rootfs{URL: "https://x/y.tar.gz", SHA256: strings.Repeat("a", 64)}, true},
+		{"no checksum", release.Rootfs{URL: "https://x/y.tar.gz"}, false},
+		{"no url", release.Rootfs{SHA256: strings.Repeat("a", 64)}, false},
+		{"neither", release.Rootfs{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := release.Engine{Version: "1.0.0", Rootfs: tc.r}
+			if got := e.Published(); got != tc.want {
+				t.Errorf("Published() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestErrNotPublishedExplainsTheWayOut(t *testing.T) {
+	// This is what a developer sees before the first release is cut, so it must
+	// name the escape hatch rather than just refusing.
+	err := error(&release.ErrNotPublished{Version: "29.7.2"})
+	for _, want := range []string{"29.7.2", "--rootfs-url", "--rootfs-sha256", "build.sh"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("message should mention %q:\n%s", want, err)
+		}
+	}
+	var typed *release.ErrNotPublished
+	if !errors.As(err, &typed) {
+		t.Error("ErrNotPublished is not matchable with errors.As")
+	}
+}

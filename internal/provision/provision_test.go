@@ -38,6 +38,10 @@ type fakeWSL struct {
 	socketUpAfter int
 	socketCalls   int
 
+	// engineVersionFile is what /etc/hawser/engine-version contains; empty
+	// means the file is absent.
+	engineVersionFile string
+
 	importErr error
 	statusErr error
 	listErr   error
@@ -110,6 +114,12 @@ func (f *fakeWSL) Exec(_ context.Context, _, _ string, args ...string) (string, 
 	}
 	if len(args) > 0 && args[0] == "tail" {
 		return "dockerd log line 1\ndockerd log line 2", nil
+	}
+	if len(args) >= 2 && args[0] == "cat" && args[1] == provision.EngineVersionFile {
+		if f.engineVersionFile == "" {
+			return "", errors.New("cat: no such file")
+		}
+		return f.engineVersionFile, nil
 	}
 	return "", nil
 }
@@ -497,5 +507,126 @@ func TestFetcherSeam(t *testing.T) {
 
 	if _, err := p.Install(context.Background(), opts); err != nil {
 		t.Fatalf("Install: %v", err)
+	}
+}
+
+func TestInstallFromLocalRootfs(t *testing.T) {
+	// The path ErrNotPublished tells developers to use: install a rootfs built
+	// locally, before any release exists. Verification still applies.
+	payload := []byte("locally built rootfs")
+	dir := t.TempDir()
+	local := filepath.Join(dir, "hawser-rootfs-29.7.2.tar.gz")
+	if err := os.WriteFile(local, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.Sum256(payload)
+
+	w := healthyWSL()
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+
+	for _, spelling := range []string{
+		local,                                // bare Windows path
+		"file:///" + filepath.ToSlash(local), // file:///C:/...
+		"file://" + filepath.ToSlash(local),  // file://C:/...
+	} {
+		t.Run(spelling, func(t *testing.T) {
+			w2 := healthyWSL()
+			p2 := &provision.Provisioner{WSL: w2, Logger: quietLogger()}
+			opts := testOptions(t, spelling, hex.EncodeToString(h[:]))
+			if _, err := p2.Install(context.Background(), opts); err != nil {
+				t.Fatalf("Install from %q: %v", spelling, err)
+			}
+			if len(w2.imported) != 1 {
+				t.Errorf("imported %d, want 1", len(w2.imported))
+			}
+		})
+	}
+	_ = p
+}
+
+func TestInstallLocalRootfsStillVerifiesChecksum(t *testing.T) {
+	// A local file is not more trusted than a downloaded one.
+	dir := t.TempDir()
+	local := filepath.Join(dir, "rootfs.tar.gz")
+	if err := os.WriteFile(local, []byte("contents"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &provision.Provisioner{WSL: healthyWSL(), Logger: quietLogger()}
+	opts := testOptions(t, local, strings.Repeat("b", 64))
+
+	var mismatch *provision.ErrChecksumMismatch
+	if _, err := p.Install(context.Background(), opts); !errors.As(err, &mismatch) {
+		t.Fatalf("error = %v, want ErrChecksumMismatch", err)
+	}
+}
+
+func TestInstallMissingLocalRootfsIsClear(t *testing.T) {
+	p := &provision.Provisioner{WSL: healthyWSL(), Logger: quietLogger()}
+	opts := testOptions(t, filepath.Join(t.TempDir(), "absent.tar.gz"), strings.Repeat("c", 64))
+
+	_, err := p.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install succeeded with a missing local rootfs")
+	}
+	if !strings.Contains(err.Error(), "local rootfs") {
+		t.Errorf("error should say the local rootfs could not be opened, got: %v", err)
+	}
+}
+
+func TestInstallReadsEngineVersionFromRootfs(t *testing.T) {
+	// With --rootfs-url and no --engine-version there is no flag to trust, so
+	// the rootfs's own /etc/hawser/engine-version is the source of truth.
+	// Without this, `hawser version` reports "engine unknown" after a
+	// development install - seen for real before this was added.
+	url, sum := rootfsServer(t, []byte("rootfs"))
+	w := healthyWSL()
+	w.engineVersionFile = "29.7.2\n"
+
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+	opts := testOptions(t, url, sum)
+	opts.EngineVersion = "" // as an override install leaves it
+
+	m, err := p.Install(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if m.EngineVersion != "29.7.2" {
+		t.Errorf("EngineVersion = %q, want 29.7.2 from the rootfs", m.EngineVersion)
+	}
+}
+
+func TestInstallPrefersExplicitEngineVersion(t *testing.T) {
+	url, sum := rootfsServer(t, []byte("rootfs"))
+	w := healthyWSL()
+	w.engineVersionFile = "1.2.3\n"
+
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+	opts := testOptions(t, url, sum) // testOptions sets 29.7.2
+
+	m, err := p.Install(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if m.EngineVersion != "29.7.2" {
+		t.Errorf("EngineVersion = %q, want the explicit 29.7.2", m.EngineVersion)
+	}
+}
+
+func TestInstallToleratesRootfsWithoutVersionMarker(t *testing.T) {
+	// An old or third-party rootfs need not carry the marker; that is not a
+	// reason to fail an install.
+	url, sum := rootfsServer(t, []byte("rootfs"))
+	w := healthyWSL() // engineVersionFile empty -> cat fails
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+	opts := testOptions(t, url, sum)
+	opts.EngineVersion = ""
+
+	m, err := p.Install(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if m.EngineVersion != "" {
+		t.Errorf("EngineVersion = %q, want empty", m.EngineVersion)
 	}
 }
