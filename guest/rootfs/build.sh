@@ -28,12 +28,17 @@ curl -fsSL -o "$work/$base.sha256" "$url.sha256"
 echo "==> building engine binaries from source (this is the slow part)"
 # Each component is built in a pinned golang image from its upstream git tag —
 # no download.docker.com artifacts, so provenance is source -> binary end to end.
+# HOST_UID/GID: the build runs as root in the container but writes into a host
+# directory, so it hands ownership back before exiting — otherwise cleanup and
+# the tar step hit permission errors on the CI runner.
 docker run --rm \
   -v "$work:/out" \
   -e "MOBY_TAG=$MOBY_TAG" \
   -e "CONTAINERD_VERSION=$CONTAINERD_VERSION" \
   -e "RUNC_VERSION=$RUNC_VERSION" \
   -e "BUILDKIT_VERSION=$BUILDKIT_VERSION" \
+  -e "HOST_UID=$(id -u)" \
+  -e "HOST_GID=$(id -g)" \
   -v "$here/build-engine.sh:/build-engine.sh:ro" \
   "golang:${GO_VERSION}-alpine" sh /build-engine.sh
 

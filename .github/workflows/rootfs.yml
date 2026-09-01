@@ -19,8 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # -x follows the `source=` directives into versions.env, which isn't a
+      # .sh file and so isn't in the argument list.
       - name: shellcheck
-        run: shellcheck guest/rootfs/*.sh spike/a/*.sh
+        run: shellcheck -x guest/rootfs/*.sh spike/a/*.sh
 
   build:
     name: build rootfs

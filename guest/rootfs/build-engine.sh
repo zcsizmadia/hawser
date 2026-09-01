@@ -37,4 +37,7 @@ clone https://github.com/moby/buildkit.git "$BUILDKIT_VERSION" buildkit
 
 strip /out/bin/* 2>/dev/null || true
 chmod 0755 /out/bin/*
+# Hand the artifacts back to the invoking user; we are root inside the container
+# but /out is a host directory (see the HOST_UID comment in build.sh).
+chown -R "${HOST_UID:-0}:${HOST_GID:-0}" /out
 ls -la /out/bin
