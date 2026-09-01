@@ -44,24 +44,34 @@ Goal: CLI-only, fresh Windows 11 VM → `docker run hello-world` in <5 min. Ship
 
 ---
 
-## v0.2 — Always-on (3 weekends → target **Sun Nov 8, 2026**)
+## v0.2 — Always-on (target **Sun Nov 8, 2026**; running ~5 weeks ahead)
 
-Goal: survives everything Windows throws at it, within a logged-on session. This is the milestone that makes the CI claim real — with the session caveat Spike B established.
+Goal: survives everything Windows throws at it, within a logged-on session (the Spike B caveat). Re-planned 2026-09-01 after v0.1's code finished early: stages replace the weekend schedule, ordered so each hardens what the next depends on. Dates stay as ceilings, not pacing.
 
-| Weekend | Work | Depends on |
-|---|---|---|
-| W4 (Oct 10–11) | Supervisor (`x/sys/windows/svc` for the plumbing, started at logon rather than as a session-0 service): supervise distro + dockerd, restart on crash and on user `wsl --shutdown`; structured logging (Event Log + rotating file) | v0.1 |
-| W5 (Oct 17–18) | Auto-logon runner playbook (documented, not automated — see PLAN §06); sleep/resume + network-change recovery (power events → socket re-verify) | Spike B (#3) |
-| W6 (Oct 31–Nov 1) | Guest agent over AF_HYPERV vsock (replaces per-connection spawn; latency parity with Desktop); on-demand start + `idle-timeout` via `hawser config`; `wsl-integrate`; `migrate --from-desktop`; tray (6 items) | W4 |
+**S0 — Acceptance first (gates tagging v0.1, feeds everything after).**
+The e2e suite (#11) runs on any Windows machine with WSL2 — the development machine qualifies; a runner VM only automates it in CI later. Suite: install from the published release → proxy → hello-world, bind mount read *through a container*, exec, `logs -f` streaming, a compose stack, testcontainers-go, process-count-returns-to-baseline (#35's regression), Docker-Desktop-still-works, uninstall-leaves-nothing. `exec -it` with a real TTY stays a documented manual check. Green suite ⇒ tag v0.1.0 and cut the first app release.
+
+**S1 — Supervisor.** One long-lived `hawser supervise` process, started at logon (scheduled task; a session-0 service is not possible pending #3's re-test), owning what `hawser proxy` does today plus: engine health loop, crash and `wsl --shutdown` recovery with backoff, sleep/resume + power-event recovery, single-instance locking, Event Log + rotating file. `hawser start/stop/restart/status --json` become real commands. Hard constraint from the Docker Desktop incident: manage only processes it spawned and the distro it owns — never kill by image name, never `wsl --shutdown`.
+
+**S2 — vsock guest agent.** No longer just latency work: it is the *complete* fix for #35, since owning both ends makes client disconnects explicit instead of inferred, and it removes the socat dependency entirely. Ships inside the rootfs (rootfs re-release), started by the supervisor, with the socat relay kept as fallback. Begin with a half-day mini-spike: AF_HYPERV dial from Windows into the WSL utility VM, since VM-GUID discovery is the uncertain part.
+
+**S3 — Adoption levers.** On-demand start + `idle-timeout` via `hawser config` (answers the idle-RAM complaint); `wsl-integrate` (socket into the user's other distros via `/mnt/wsl`); `migrate --from-desktop` via `docker save/load` + volume tar streaming — slower than VHDX surgery but cannot corrupt the source, and Desktop stays untouched if interrupted.
+
+**S4 — Tray (6 items, forever) and the auto-logon runner playbook** (documented, never automated — PLAN §06).
+
+**In-flight from earlier milestones:** #3 Spike B re-test (needs the clean VM; settles whether a service mode can exist alongside logon mode) and #35 (bounded now, closed by S2).
 
 **Exit criteria:**
+- [ ] e2e suite green on a real Windows+WSL2 machine, including compose and testcontainers-go
 - [ ] kill `wsl.exe` / `wsl --shutdown` / reboot / sleep-resume → next `docker ps` works, zero clicks
 - [ ] on a machine with auto-logon configured, a reboot brings the engine back and a container job runs with **nobody physically present**
 - [ ] pipe round-trip latency within 2× of Docker Desktop on `docker version` (vsock agent)
+- [ ] relay process count returns to baseline after killing clients mid-request (#35 closed, not bounded)
 - [ ] `migrate --from-desktop` round-trips images + volumes on a machine with real Desktop state
-- [ ] idle-timeout stops the VM; first `docker ps` after cold-starts it in ~2 s
+- [ ] idle-timeout stops the VM; first `docker ps` after cold-starts it (measure the real number; "~2 s" is still an assumption)
+- [ ] Docker Desktop fully functional after a Hawser install → exercise → uninstall cycle
 
-**Retires risks:** idle-RAM complaint, unattended recovery. (Session-0 is no longer a risk to retire — it is a settled constraint, #3.) **Note:** wslc GA likely lands during this window — have the v0.1 comparison post ready to ride it, and note that wslc inherits the same session requirement.
+**Retires risks:** idle-RAM complaint, unattended recovery, the #35 leak. **Note:** wslc GA likely lands during this window — have the comparison post ready, and note wslc inherits the same session requirement.
 
 ---
 
