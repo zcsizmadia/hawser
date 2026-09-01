@@ -124,9 +124,19 @@ func probe() {
 	visible := err == nil && strings.Contains(out, d)
 	logEvent(event{Phase: "distro-visible", Detail: d, OK: boolp(visible)})
 	if !visible {
-		logEvent(event{Phase: "conclusion",
-			Detail: "target distro not visible in this account - per-user registration confirmed as the blocker",
-			OK:     boolp(false)})
+		// Distinguish the causes rather than assuming one. The first run of
+		// this spike hit WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED under LocalSystem,
+		// which is an outright refusal by WSL and nothing to do with per-user
+		// registration - reporting it as registration would have recorded the
+		// wrong conclusion in the issue.
+		detail := "target distro not visible to this account - per-user registration (HKCU\\...\\Lxss) is the likely blocker"
+		if strings.Contains(out, "WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED") ||
+			strings.Contains(out, "as local system is not supported") {
+			detail = "WSL refuses to run as LocalSystem (WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED): " +
+				"this account can never work, regardless of distro registration. " +
+				"A dedicated service account is the only remaining pattern."
+		}
+		logEvent(event{Phase: "conclusion", Detail: detail, OK: boolp(false)})
 		return
 	}
 
