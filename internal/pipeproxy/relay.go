@@ -1,0 +1,212 @@
+// Package pipeproxy bridges the Windows named pipe that stock docker.exe
+// expects to the engine's Unix socket inside the WSL2 distro.
+//
+// This is the load-bearing component the project is named for. Spike A (#2)
+// proved the design end to end and measured it: the per-connection relay
+// process starts in ~6 ms, while the surrounding wsl.exe startup costs ~165 ms
+// per connection — the cost the v0.2 vsock agent removes. Correctness matters
+// more than either number, because every Docker client behavior rides on it:
+// hijacked streams (exec -it, attach), incremental streaming (logs -f), and
+// half-closes (build, save) all break in different, confusing ways if the relay
+// is sloppy.
+//
+// The transport deliberately knows nothing about HTTP. Byte-for-byte fidelity
+// is what makes hijacked connections work at all; request rewriting (bind path
+// translation) is layered on top rather than baked in here.
+package pipeproxy
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"sync"
+)
+
+// Dialer opens one connection to the engine socket. Production dials through
+// wsl.exe; tests substitute a local socket, which is why the transport can be
+// verified on any machine without WSL2.
+type Dialer interface {
+	Dial(ctx context.Context) (io.ReadWriteCloser, error)
+}
+
+// DialerFunc adapts a function to Dialer.
+type DialerFunc func(ctx context.Context) (io.ReadWriteCloser, error)
+
+// Dial implements Dialer.
+func (f DialerFunc) Dial(ctx context.Context) (io.ReadWriteCloser, error) { return f(ctx) }
+
+// halfCloser is implemented by connections that can signal "no more writes"
+// without tearing the whole connection down. Propagating this is what lets a
+// client send a request body, half-close, and still read the response — the
+// docker build and docker save pattern.
+type halfCloser interface {
+	CloseWrite() error
+}
+
+// Server accepts client connections and relays each to the engine.
+type Server struct {
+	// Dialer opens the engine side of each connection. Required.
+	Dialer Dialer
+
+	// Logger receives connection lifecycle events. Defaults to slog.Default().
+	Logger *slog.Logger
+
+	// OnAccept, if set, wraps each accepted connection before relaying. The
+	// HTTP-rewriting layer hooks in here, so the transport stays oblivious.
+	OnAccept func(client net.Conn) net.Conn
+
+	wg sync.WaitGroup
+
+	mu     sync.Mutex
+	active map[io.Closer]struct{}
+}
+
+// track registers a connection so shutdown can close it. Without this, a
+// client holding a streaming connection open (docker logs -f, docker events)
+// would block service shutdown indefinitely: the relay only returns when one
+// side goes away, and neither side has a reason to.
+func (s *Server) track(c io.Closer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active == nil {
+		s.active = make(map[io.Closer]struct{})
+	}
+	s.active[c] = struct{}{}
+}
+
+func (s *Server) untrack(c io.Closer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.active, c)
+}
+
+// closeActive tears down every live connection, unblocking their relays.
+func (s *Server) closeActive() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for c := range s.active {
+		c.Close()
+	}
+}
+
+func (s *Server) logger() *slog.Logger {
+	if s.Logger != nil {
+		return s.Logger
+	}
+	return slog.Default()
+}
+
+// Serve accepts connections until ctx is cancelled or the listener fails, then
+// waits for in-flight connections to finish. Closing the listener is the
+// caller's job: Serve returns as soon as Accept fails, which is what a closed
+// listener produces.
+func (s *Server) Serve(ctx context.Context, l net.Listener) error {
+	if s.Dialer == nil {
+		return errors.New("pipeproxy: Dialer is required")
+	}
+
+	// Unblock Accept on cancellation — a named pipe Accept has no deadline —
+	// and drop live connections so a streaming client cannot pin shutdown.
+	go func() {
+		<-ctx.Done()
+		l.Close()
+		s.closeActive()
+	}()
+
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			s.wg.Wait()
+			if ctx.Err() != nil {
+				return nil // shutdown, not failure
+			}
+			return fmt.Errorf("pipeproxy: accept: %w", err)
+		}
+
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handle(ctx, conn)
+		}()
+	}
+}
+
+func (s *Server) handle(ctx context.Context, client net.Conn) {
+	log := s.logger()
+	defer client.Close()
+
+	s.track(client)
+	defer s.untrack(client)
+
+	if s.OnAccept != nil {
+		client = s.OnAccept(client)
+	}
+
+	engine, err := s.Dialer.Dial(ctx)
+	if err != nil {
+		// The client is left to see a closed connection; there is no HTTP
+		// response to send, because the transport does not speak HTTP.
+		log.Error("dial engine", "error", err)
+		return
+	}
+	defer engine.Close()
+
+	s.track(engine)
+	defer s.untrack(engine)
+
+	if err := Relay(client, engine); err != nil {
+		log.Debug("relay ended", "error", err)
+	}
+}
+
+// Relay copies bytes in both directions until both are done.
+//
+// Each direction propagates its own end-of-stream as a half-close rather than a
+// full close, so a client that finished sending can still read the response.
+// Both directions must be allowed to drain: returning as soon as one finishes
+// would truncate the other, which is how naive relays break `docker build`.
+func Relay(client, engine io.ReadWriteCloser) error {
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(engine, client)
+		errs[0] = err
+		closeWrite(engine)
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(client, engine)
+		errs[1] = err
+		closeWrite(client)
+	}()
+	wg.Wait()
+
+	return errors.Join(filterClosed(errs[0]), filterClosed(errs[1]))
+}
+
+// closeWrite signals end-of-stream to the peer, preferring a half-close so the
+// other direction survives. Types without CloseWrite get nothing: a full Close
+// here would kill the still-active reverse direction.
+func closeWrite(c io.ReadWriteCloser) {
+	if hc, ok := c.(halfCloser); ok {
+		hc.CloseWrite()
+	}
+}
+
+// filterClosed drops the errors that mean "the other end went away", which is
+// the normal way a docker client ends a connection, not a fault worth logging.
+func filterClosed(err error) error {
+	if err == nil ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.ErrClosedPipe) {
+		return nil
+	}
+	return err
+}
