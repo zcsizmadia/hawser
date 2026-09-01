@@ -355,3 +355,20 @@ func (p *Provisioner) ReadManifest(opts Options) (*Manifest, error) {
 	}
 	return &m, nil
 }
+
+// EngineRunning reports whether the engine socket answers inside the distro.
+func (p *Provisioner) EngineRunning(ctx context.Context, opts Options) bool {
+	opts = opts.withDefaults()
+	running, _ := p.engineRunning(ctx, opts)
+	return running
+}
+
+// StopEngine terminates the engine's own distro — and nothing else. This is
+// the only stop primitive Hawser has on purpose: `wsl --shutdown` stops every
+// distro on the machine, including Docker Desktop's and the user's own, and is
+// never called (PLAN §02; the coexistence note on #35).
+func (p *Provisioner) StopEngine(ctx context.Context, opts Options) error {
+	opts = opts.withDefaults()
+	p.logger().Info("terminating distro", "distro", opts.Distro)
+	return p.wsl().Terminate(ctx, opts.Distro)
+}
