@@ -75,11 +75,18 @@ tar -xzf "$work/$base" -C "$root"
 # Installed with apk --root from a matching Alpine container, so the versions
 # come from the same branch as the base.
 echo "==> installing guest packages"
-docker run --rm -v "$root:/rootfs" "alpine:${ALPINE_BRANCH#v}" sh -c '
+# The chown matters: apk writes as root into a host directory, and without it
+# cleanup and the tar step fail with "Permission denied" on the runner. The tar
+# below forces owner 0:0 into the archive regardless, so host ownership here has
+# no effect on the shipped rootfs.
+docker run --rm -v "$root:/rootfs" \
+    -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
+    "alpine:${ALPINE_BRANCH#v}" sh -c '
     set -eu
     cp /etc/apk/repositories /rootfs/etc/apk/repositories
     apk add --root /rootfs --no-cache \
         socat iptables ip6tables iproute2 ca-certificates
+    chown -R "${HOST_UID}:${HOST_GID}" /rootfs
 '
 
 install -d "$root/usr/local/bin" "$root/etc/docker" "$root/etc/hawser"
