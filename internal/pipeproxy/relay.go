@@ -161,7 +161,11 @@ func (s *Server) handle(ctx context.Context, client net.Conn) {
 		handler = func(c net.Conn, e io.ReadWriteCloser) error { return Relay(c, e) }
 	}
 	if err := handler(client, engine); err != nil {
-		log.Debug("connection ended", "error", err)
+		// Warn, not Debug: filterClosed has already dropped the ordinary ways a
+		// docker client hangs up, so anything left is a real fault the user
+		// wants to see. An engine that is down otherwise looks like the bridge
+		// doing nothing at all.
+		log.Warn("connection failed", "error", err)
 	}
 }
 
