@@ -1,0 +1,10 @@
+# build output
+/out/
+guest/rootfs/out/
+spike/a/dl/
+*.exe
+
+# go
+/hawser
+go.work
+go.work.sum

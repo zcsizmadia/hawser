@@ -1,0 +1,64 @@
+name: rootfs
+
+on:
+  push:
+    branches: [main]
+    paths: ['guest/rootfs/**', '.github/workflows/rootfs.yml']
+  pull_request:
+    paths: ['guest/rootfs/**', '.github/workflows/rootfs.yml']
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Same invocation as scripts/lint.ps1 and the pre-commit hook: -x follows
+      # `source=` directives, -P SCRIPTDIR resolves them next to each script
+      # (versions.env sits beside build.sh, not in the working directory).
+      - name: shellcheck
+        run: shellcheck -x -P SCRIPTDIR guest/rootfs/*.sh spike/a/*.sh
+
+  build:
+    name: build rootfs
+    runs-on: ubuntu-latest
+    # The from-source engine build takes ~30 min; on PRs it only runs when the
+    # rootfs itself changed (see paths filter), which is what we want to gate.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        run: ./guest/rootfs/build.sh "$GITHUB_WORKSPACE/out"
+
+      - name: smoke test the rootfs
+        run: ./guest/rootfs/smoke-test.sh "$GITHUB_WORKSPACE/out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hawser-rootfs
+          path: out/
+          retention-days: 14
+
+  publish:
+    name: attach to release
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: hawser-rootfs
+          path: out
+      - name: upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" out/* --clobber
