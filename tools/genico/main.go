@@ -27,14 +27,14 @@ func ico(c color.RGBA) []byte {
 	}
 	// BMP (DIB) payload: 40-byte header, BGRA pixels bottom-up, then AND mask.
 	var dib bytes.Buffer
-	binary.Write(&dib, binary.LittleEndian, uint32(40))       // header size
-	binary.Write(&dib, binary.LittleEndian, int32(n))         // width
-	binary.Write(&dib, binary.LittleEndian, int32(n*2))       // height (XOR+AND)
-	binary.Write(&dib, binary.LittleEndian, uint16(1))        // planes
-	binary.Write(&dib, binary.LittleEndian, uint16(32))       // bpp
-	binary.Write(&dib, binary.LittleEndian, uint32(0))        // compression
-	binary.Write(&dib, binary.LittleEndian, uint32(0))        // image size
-	binary.Write(&dib, binary.LittleEndian, [4]int32{})       // ppm + colors
+	binary.Write(&dib, binary.LittleEndian, uint32(40)) // header size
+	binary.Write(&dib, binary.LittleEndian, int32(n))   // width
+	binary.Write(&dib, binary.LittleEndian, int32(n*2)) // height (XOR+AND)
+	binary.Write(&dib, binary.LittleEndian, uint16(1))  // planes
+	binary.Write(&dib, binary.LittleEndian, uint16(32)) // bpp
+	binary.Write(&dib, binary.LittleEndian, uint32(0))  // compression
+	binary.Write(&dib, binary.LittleEndian, uint32(0))  // image size
+	binary.Write(&dib, binary.LittleEndian, [4]int32{}) // ppm + colors
 	for y := n - 1; y >= 0; y-- {
 		for x := 0; x < n; x++ {
 			px := img.RGBAAt(x, y)
@@ -63,7 +63,10 @@ func main() {
 	red := ico(color.RGBA{218, 54, 51, 255})
 	var b bytes.Buffer
 	fmt.Fprint(&b, "//go:build windows\n\npackage main\n\n// Generated 16x16 solid-dot tray icons. Regenerate with `go run ./tools/genico <path>`.\n\n")
-	for _, e := range []struct{ name string; data []byte }{{"iconGreen", green}, {"iconGrey", grey}, {"iconRed", red}} {
+	for _, e := range []struct {
+		name string
+		data []byte
+	}{{"iconGreen", green}, {"iconGrey", grey}, {"iconRed", red}} {
 		name, data := e.name, e.data
 		fmt.Fprintf(&b, "var %s = []byte{", name)
 		for i, by := range data {
