@@ -73,6 +73,27 @@ for c in moby containerd runc buildkit; do
         || { echo "no commit recorded for $c"; exit 1; }
 done
 
+echo "==> runtime dependencies the engine and bridge need at boot"
+# Absent from the Alpine minirootfs, and their absence only shows up when the
+# artifact is booted: no iptables means dockerd cannot build container
+# networking, no socat means the pipe relay has nothing to talk to.
+# Located by name rather than by path: distributions move binaries between
+# /sbin, /usr/sbin and /usr/bin, and hardcoding one of them tests the layout
+# instead of the dependency.
+for dep in socat iptables ip6tables docker-init nsenter modprobe pigz; do
+    found=""
+    for d in bin sbin usr/bin usr/sbin usr/local/bin; do
+        # -L as well as -e: an absolute symlink inside the rootfs dangles when
+        # inspected from outside it, and is still a present dependency.
+        if [ -e "$work/$d/$dep" ] || [ -L "$work/$d/$dep" ]; then
+            found="$d/$dep"
+            break
+        fi
+    done
+    [ -n "$found" ] || { echo "missing runtime dependency: $dep"; exit 1; }
+    echo "  ok $found"
+done
+
 echo "==> statically linked (no interpreter needed inside the minimal rootfs)"
 for b in dockerd containerd runc buildkitd; do
     if file "$work/usr/local/bin/$b" | grep -q "dynamically linked"; then

@@ -1,0 +1,53 @@
+# Assembles the Hawser rootfs.
+#
+# Built as a container image and then `docker export`ed, rather than unpacked
+# and modified on the host. That matters: apk's post-install triggers run
+# chrooted, and `apk --root` against a host directory fails them with exit 127
+# (ca-certificates hashes, terminfo, iproute2), leaving a rootfs that looks
+# populated but is subtly wrong. Building natively runs every trigger the way
+# Alpine intends, and sidesteps the root-owned-files problem on the runner.
+ARG ALPINE_TAG=3.24
+FROM alpine:${ALPINE_TAG}
+
+# Runtime dependencies. None of these are in the Alpine minirootfs, and their
+# absence only surfaces when the engine is actually booted:
+#   iptables/ip6tables  dockerd cannot build container networking without them
+#   iproute2            ip/tc, used for veth and bridge setup
+#   ca-certificates     registry TLS
+#   socat               the v0.1 pipe relay connects through it
+#   e2fsprogs/xfsprogs  filesystem tooling for volumes
+#   kmod                modprobe for overlay, br_netfilter, ip_tables
+#   util-linux          mount, nsenter, unshare
+#   pigz                parallel gunzip; a large, cheap win on image pulls
+#   xz                  xz-compressed image layers
+#   tini-static         becomes docker-init, which `docker run --init` needs.
+#                       moby vendors tini rather than exposing a make target
+#                       for it, so it comes from Alpine (also MIT-licensed).
+#                       Copied rather than symlinked: an absolute symlink
+#                       dangles whenever the rootfs is inspected from outside,
+#                       which is exactly what the smoke test does.
+RUN apk add --no-cache \
+        socat \
+        iptables ip6tables iproute2 \
+        ca-certificates \
+        e2fsprogs xfsprogs \
+        kmod util-linux \
+        pigz xz \
+        tini-static \
+    && cp /sbin/tini-static /usr/local/bin/docker-init
+
+COPY bin/ /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/*
+
+# Engine defaults: log rotation on from the first run (PLAN §05 v0.1).
+COPY daemon.json /etc/docker/daemon.json
+
+# WSL-side distro config. systemd is off: Hawser supervises dockerd itself, so
+# an init system inside the distro buys nothing.
+COPY wsl.conf /etc/wsl.conf
+
+# What the rootfs declares about itself: `hawser install` reads engine-version
+# when no version is given, and `commits` is the provenance record a security
+# review reads.
+COPY engine-version /etc/hawser/engine-version
+COPY commits /etc/hawser/commits
