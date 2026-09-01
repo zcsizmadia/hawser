@@ -34,13 +34,18 @@ for f in usr/local/bin/dockerd usr/local/bin/containerd usr/local/bin/runc \
     echo "  ok $f"
 done
 
-echo "==> daemon.json is valid JSON with log rotation"
+echo "==> daemon.json is accepted by the engine, not merely valid JSON"
+# `dockerd --validate` parses the config the way the real daemon does and exits.
+# The earlier version of this check only asserted the JSON shape, which is why a
+# bad log opt ("max-files" instead of "max-file") passed CI and was caught by
+# hand in Spike A instead — dockerd refused to start with it. Never again.
 python3 - "$work/etc/docker/daemon.json" <<'PY'
 import json, sys
 cfg = json.load(open(sys.argv[1]))
 assert cfg["log-opts"]["max-size"], "log rotation not configured"
-print("  ok", cfg)
+print("  ok, parses:", cfg)
 PY
+"$work/usr/local/bin/dockerd" --validate --config-file "$work/etc/docker/daemon.json"
 
 echo "==> binaries execute and report the pinned versions"
 "$work/usr/local/bin/dockerd" --version
