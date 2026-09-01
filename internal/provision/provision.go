@@ -217,10 +217,11 @@ func (p *Provisioner) StartEngine(ctx context.Context, opts Options) error {
 
 	if running, _ := p.engineRunning(ctx, opts); running {
 		p.logger().Info("engine already running", "distro", opts.Distro)
-		// The agent's lifetime is not tied to dockerd's: a supervisor that
-		// finds a healthy engine (its own restart, say) must still make sure
-		// the vsock path is up.
+		// Neither the agent nor the socket share is tied to dockerd's
+		// lifetime: a supervisor that finds a healthy engine (its own
+		// restart, say) must still make sure both are up.
 		p.startAgent(ctx, opts)
+		p.shareEngineSocket(ctx, opts)
 		return nil
 	}
 
@@ -237,6 +238,10 @@ func (p *Provisioner) StartEngine(ctx context.Context, opts Options) error {
 	for time.Now().Before(deadline) {
 		if running, _ := p.engineRunning(ctx, opts); running {
 			p.logger().Info("engine socket is up", "distro", opts.Distro)
+			// Shared only once the socket exists: a bind mount of a missing
+			// file cannot be made, and the share is re-done on every start
+			// because the previous engine's bind went stale with it.
+			p.shareEngineSocket(ctx, opts)
 			return nil
 		}
 		select {
@@ -250,6 +255,43 @@ func (p *Provisioner) StartEngine(ctx context.Context, opts Options) error {
 	log, _ := p.wsl().Exec(ctx, opts.Distro, "root", "tail", "-30", "/var/log/dockerd.log")
 	return fmt.Errorf("dockerd did not create %s within %s. Last log lines:\n%s",
 		EngineSocket, opts.StartTimeout, log)
+}
+
+// SharedSocketPath is where the engine socket is bind-mounted for other WSL
+// distros (#42): /mnt/wsl is a tmpfs shared VM-wide across every distro, and a
+// bind mount of the socket file shares the live inode, which a symlink cannot
+// (it would resolve in the reader's own namespace, where /var/run/docker.sock
+// does not exist). Namespaced by distro name so a second install — the e2e
+// suite runs one beside a real install — shares its own socket, not a
+// collision.
+func SharedSocketPath(distro string) string {
+	return "/mnt/wsl/" + distro + "/docker.sock"
+}
+
+// shareEngineSocket publishes the engine socket at SharedSocketPath,
+// best-effort: sharing is Desktop-parity plumbing for wsl-integrate, and its
+// failure must not fail an engine start. The path travels as a positional
+// parameter, never spliced into the script, so a hostile distro name cannot
+// inject shell. A stale share from a previous engine run (the bind outlives
+// the distro in the VM's tmpfs) is unmounted first.
+//
+// The socket is chmod'd 0666 so the *ordinary* user in an integrated distro
+// can reach it — dockerd creates it 0660 root:root, and UIDs/groups do not
+// map reliably across distros, so group-based access is unreliable where a
+// world bit is not. This does not widen the trust boundary: the engine is
+// already reachable by any process in the user's Windows session through the
+// named pipe, and /mnt/wsl is shared only among that user's own distros in
+// their own utility VM. chmod targets the shared inode, so the engine's own
+// /var/run/docker.sock (which only root touches inside the engine distro) is
+// affected too, which is immaterial there.
+func (p *Provisioner) shareEngineSocket(ctx context.Context, opts Options) {
+	const script = `dir=$(dirname "$1") && mkdir -p "$dir" && ` +
+		`{ umount "$1" 2>/dev/null || true; } && rm -f "$1" && touch "$1" && ` +
+		`mount --bind /var/run/docker.sock "$1" && chmod 0666 "$1"`
+	if _, err := p.wsl().Exec(ctx, opts.Distro, "root",
+		"sh", "-c", script, "sh", SharedSocketPath(opts.Distro)); err != nil {
+		p.logger().Debug("engine socket not shared to /mnt/wsl", "error", err)
+	}
 }
 
 // agentStartCmd is what launches hawser-agent (#40), guarded three ways: a
@@ -305,6 +347,14 @@ func (p *Provisioner) Uninstall(ctx context.Context, opts Options) error {
 	}
 
 	if registered {
+		// Clear the /mnt/wsl share first, while the distro can still run a
+		// command: after unregister the dead socket file would sit in the
+		// VM's shared tmpfs until the next VM restart. Best-effort — a
+		// stopped distro would be booted just to clean a tmpfs entry.
+		const unshare = `umount "$1" 2>/dev/null; rm -rf "$(dirname "$1")"`
+		p.wsl().Exec(ctx, opts.Distro, "root",
+			"sh", "-c", unshare, "sh", SharedSocketPath(opts.Distro))
+
 		p.logger().Info("terminating distro", "distro", opts.Distro)
 		if err := p.wsl().Terminate(ctx, opts.Distro); err != nil {
 			// Not fatal: unregister stops it anyway.
