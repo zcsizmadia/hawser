@@ -1,0 +1,64 @@
+# Releasing
+
+Two independent release streams, deliberately kept apart:
+
+| stream | tag | what it publishes | workflow |
+|---|---|---|---|
+| **rootfs** | `rootfs-vX.Y.Z` | the engine tarball, its `.sha256`, and an SPDX SBOM | `rootfs.yml` |
+| **app** | `vX.Y.Z` | `hawser.exe` for amd64 and arm64, zipped, plus `SHA256SUMS` | `release.yml` |
+
+They are separate because the engine and the app version independently: an engine
+security patch should not require an app release, and vice versa (PLAN §04,
+`hawser engine upgrade`). Both workflows check the tag prefix, so a rootfs
+release never gets app binaries attached and an app release never gets a rootfs.
+
+## The ordering that matters
+
+An app release embeds the rootfs checksum in
+[`internal/release/manifest.json`](internal/release/manifest.json). So the rootfs
+has to exist first:
+
+1. **Cut the rootfs release.** Tag `rootfs-v<engine-version>` — e.g.
+   `rootfs-v29.7.2`, matching `ENGINE_VERSION` in `guest/rootfs/versions.env`.
+   Publishing it triggers `rootfs.yml`, which rebuilds from source (or restores
+   the cached binaries), runs the smoke test, and attaches the three assets.
+2. **Copy the published checksum into the manifest.** Take the value from the
+   uploaded `.sha256` and put it in `manifest.json` under
+   `engines[].rootfs.sha256`, confirming the `url` matches the tag you used.
+   Merge that as a normal PR — a test asserts the manifest agrees with
+   `versions.env`.
+3. **Cut the app release.** Tag `v<app-version>`. `release.yml` builds both
+   architectures, asserts the version stamp actually took, packages, and
+   attaches the zips with `SHA256SUMS`.
+
+Until step 2 lands, `hawser install` refuses with a message telling the user to
+pass `--rootfs-url` and `--rootfs-sha256` explicitly. That is intentional: there
+is no code path that installs an unverified rootfs.
+
+## Dry runs
+
+Both workflows can be exercised without publishing:
+
+- `release.yml` — run it from the Actions tab (`workflow_dispatch`) with a
+  version string. It builds, verifies the stamp, packages, and uploads to the
+  workflow's own artifacts, but attaches nothing to any release.
+- `rootfs.yml` — `workflow_dispatch` builds and smoke-tests without publishing.
+
+Worth doing before the first real release of either stream, since release
+plumbing is the kind of thing you want to have already debugged.
+
+## Pre-releases
+
+Use a normal semver pre-release tag (`v0.1.0-preview.1`) and tick **"Set as a
+pre-release"** so it does not become `latest`. Everything else behaves the same.
+Pre-releases are the right way to shake out the pipeline; the version stamp
+check means a preview that reports `dev` fails the build rather than shipping.
+
+## What is not in place yet
+
+- **Code signing.** Lands in v0.4 with Azure Trusted Signing or SignPath. Until
+  then binaries are unsigned and SmartScreen will warn. `SHA256SUMS` is
+  published so a download can be verified, which is not a substitute.
+- **winget / scoop / choco manifests.** Also v0.4.
+- No release currently updates `manifest.json` automatically; step 2 above is
+  deliberately a reviewed commit, because it changes what every install fetches.

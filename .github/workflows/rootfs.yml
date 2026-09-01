@@ -6,6 +6,8 @@ on:
     paths: ['guest/rootfs/**', '.github/workflows/rootfs.yml']
   pull_request:
     paths: ['guest/rootfs/**', '.github/workflows/rootfs.yml']
+  # A rootfs release (tag: rootfs-vX.Y.Z) rebuilds and attaches its assets.
+  # App releases are handled by release.yml and skip the publish job below.
   release:
     types: [published]
   workflow_dispatch:
@@ -65,7 +67,11 @@ jobs:
   publish:
     name: attach to release
     needs: build
-    if: github.event_name == 'release'
+    # Only rootfs releases, which carry a rootfs- tag prefix. Without this
+    # check every app release (v0.1.0, previews) would also get rootfs
+    # tarballs attached to it, because the release event does not distinguish
+    # what is being released.
+    if: github.event_name == 'release' && startsWith(github.event.release.tag_name, 'rootfs-')
     runs-on: ubuntu-latest
     permissions:
       contents: write
