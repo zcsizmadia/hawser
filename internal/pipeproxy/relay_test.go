@@ -374,3 +374,105 @@ func TestCustomHandlerReplacesRelay(t *testing.T) {
 		t.Error("custom Handler was not called")
 	}
 }
+
+// closeTracker records whether the engine side was fully closed, which is what
+// reaps the relay child in production.
+type closeTracker struct {
+	net.Conn
+	mu          sync.Mutex
+	closed      bool
+	writeClosed bool
+}
+
+func (c *closeTracker) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return c.Conn.Close()
+}
+
+func (c *closeTracker) CloseWrite() error {
+	c.mu.Lock()
+	c.writeClosed = true
+	c.mu.Unlock()
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func (c *closeTracker) state() (closed, writeClosed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed, c.writeClosed
+}
+
+func TestRelayClosesEngineOnClientError(t *testing.T) {
+	// When the client connection fails outright (reset, pipe broken) the relay
+	// must tear the engine side down rather than half-close it: socat does not
+	// exit on stdin EOF, so half-closing would strand the child (#35).
+	//
+	// Note the limit of this: a client that closes CLEANLY - a Ctrl-C'd docker
+	// CLI - produces EOF, which is indistinguishable from the half-close that
+	// `docker build` legitimately performs. That case is bounded by socat's -T
+	// idle timeout instead, and only fully solved by the v0.2 agent, where
+	// Hawser owns both ends of the connection.
+	engine := newServer(t, func(c net.Conn) { select {} })
+
+	client, server := net.Pipe()
+	econn, err := net.Dial("tcp", engine.l.Addr().String())
+	if err != nil {
+		t.Fatalf("dial engine: %v", err)
+	}
+	tracked := &closeTracker{Conn: econn}
+
+	done := make(chan error, 1)
+	go func() { done <- pipeproxy.Relay(server, tracked) }()
+
+	// Closing the relay's own side surfaces as a read error, not EOF.
+	server.Close()
+	client.Close()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Relay did not return after the client connection failed")
+	}
+
+	if closed, _ := tracked.state(); !closed {
+		t.Error("engine connection was not closed, so the relay process would leak")
+	}
+}
+
+func TestRelayHalfClosesOnCleanClientEOF(t *testing.T) {
+	// The other half of the contract: a client that half-closes cleanly (docker
+	// build sending a context, then waiting) must NOT have its engine
+	// connection torn down, or the response is lost.
+	engine := newServer(t, func(c net.Conn) {
+		io.ReadAll(c)
+		io.WriteString(c, "response after half-close")
+	})
+
+	addr, stop := startProxy(t, &pipeproxy.Server{Dialer: engine.dialer()})
+	defer stop()
+
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	io.WriteString(c, "request body")
+	if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got, err := io.ReadAll(c)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "response after half-close" {
+		t.Errorf("got %q; a clean half-close must still receive the response", got)
+	}
+}
