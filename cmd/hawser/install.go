@@ -12,10 +12,12 @@ import (
 
 	"github.com/zcsizmadia/hawser/internal/autostart"
 	"github.com/zcsizmadia/hawser/internal/dockerctx"
+	"github.com/zcsizmadia/hawser/internal/integrate"
 	"github.com/zcsizmadia/hawser/internal/logging"
 	"github.com/zcsizmadia/hawser/internal/pipeproxy"
 	"github.com/zcsizmadia/hawser/internal/provision"
 	"github.com/zcsizmadia/hawser/internal/release"
+	"github.com/zcsizmadia/hawser/internal/wsl"
 )
 
 // cliLogger prints progress as plain lines rather than structured logfmt: this
@@ -281,6 +283,10 @@ flags:
 	if err := logging.UnregisterEventSource(); err != nil {
 		log.Debug("event log source not unregistered (needs elevation; cosmetic)", "error", err)
 	}
+
+	// Unwire every distro wsl-integrate touched: "nothing else on the system
+	// was modified" must include profile scripts in the user's own distros.
+	(&integrate.Manager{WSL: &wsl.Local{}, StateDir: opts.StateDir, Logger: log}).RemoveAll(ctx)
 
 	// Remove the context before the distro: leaving a context pointed at a
 	// pipe nobody serves would make every later docker command fail, which is

@@ -37,6 +37,7 @@ func commands() []command {
 		{"stop", "stop the engine; it stays stopped until start", runStop},
 		{"supervise", "serve the pipe and keep the engine alive (the always-on layer)", runSupervise},
 		{"uninstall", "remove the engine distro and Hawser's state", runUninstall},
+		{"wsl-integrate", "point docker inside your own WSL distros at the engine", runWSLIntegrate},
 		{"version", "report every component version and which docker.exe is active", runVersion},
 	}
 }

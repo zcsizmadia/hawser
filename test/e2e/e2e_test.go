@@ -80,6 +80,7 @@ func TestAcceptance(t *testing.T) {
 		{"ExecInRunningContainer", stageExec},
 		{"LogsFollowStreams", stageLogsFollow},
 		{"ComposeStack", stageCompose},
+		{"WSLIntegrateSharesEngine", stageWSLIntegrate},
 		{"IdleStopAndOnDemandWake", stageIdle},
 		{"InterruptedClientDoesNotWedgeBridge", stageInterrupt},
 		{"VsockPathServedEverything", stageVsockServed},
@@ -461,6 +462,60 @@ func stageIdle(t *testing.T, s *state) {
 
 	if engine, _ := statusJSON(); engine != "running" {
 		t.Errorf("engine is %q after the on-demand wake, want running", engine)
+	}
+}
+
+func stageWSLIntegrate(t *testing.T, s *state) {
+	// #42 end to end, against a real second distro: the engine socket is
+	// shared VM-wide at /mnt/wsl/<distro>/docker.sock, wsl-integrate wires a
+	// target distro's DOCKER_HOST to it, --remove unwires cleanly.
+	list, _ := run(t, 30*time.Second, "wsl.exe", "--list", "--quiet")
+	if !strings.Contains(strings.ReplaceAll(list, "\x00", ""), "Ubuntu") {
+		t.Skip("no Ubuntu distro to integrate against")
+	}
+	// Never clobber a real integration: if the user's Ubuntu already carries
+	// the profile script, this stage's --remove would delete theirs.
+	if _, err := run(t, 30*time.Second, "wsl.exe", "-d", "Ubuntu",
+		"--", "test", "-f", "/etc/profile.d/hawser.sh"); err == nil {
+		t.Skip("Ubuntu already has a hawser integration; not touching it")
+	}
+
+	// The engine's socket must be visible from the OTHER distro — that is
+	// the whole point of the /mnt/wsl bind.
+	sock := "/mnt/wsl/" + distro + "/docker.sock"
+	if out, err := run(t, 30*time.Second, "wsl.exe", "-d", "Ubuntu",
+		"--", "test", "-S", sock); err != nil {
+		t.Fatalf("shared socket %s not visible from Ubuntu: %v\n%s", sock, err, out)
+	}
+	// And it must actually answer, as the ORDINARY user (not root): the point
+	// of the share is docker-without-sudo, which needs the 0666 the
+	// provisioner sets. A dead inode also passes test -S, so this is the real
+	// check. Skip only when curl is genuinely absent (exit 127), not when it
+	// runs and fails.
+	if _, err := run(t, 30*time.Second, "wsl.exe", "-d", "Ubuntu", "--", "sh", "-c", "command -v curl"); err != nil {
+		t.Log("curl absent in Ubuntu; socket presence checked but not exercised")
+	} else {
+		out, err := run(t, 30*time.Second, "wsl.exe", "-d", "Ubuntu", "--",
+			"curl", "-s", "--max-time", "10", "--unix-socket", sock, "http://localhost/_ping")
+		if err != nil || out != "OK" {
+			t.Errorf("engine ping from Ubuntu as the ordinary user = %q (%v); want OK — the shared socket must be user-accessible, not root-only", out, err)
+		}
+	}
+
+	out, err := run(t, time.Minute, s.hawser, "wsl-integrate", "--state-dir", s.stateDir, "Ubuntu")
+	must(t, out, err, "hawser wsl-integrate Ubuntu")
+	defer run(t, time.Minute, s.hawser, "wsl-integrate", "--state-dir", s.stateDir, "--remove", "Ubuntu")
+
+	if out, err := run(t, 30*time.Second, "wsl.exe", "-d", "Ubuntu",
+		"--", "cat", "/etc/profile.d/hawser.sh"); err != nil || !strings.Contains(out, sock) {
+		t.Errorf("profile script wrong or missing (%v):\n%s", err, out)
+	}
+
+	out, err = run(t, time.Minute, s.hawser, "wsl-integrate", "--state-dir", s.stateDir, "--remove", "Ubuntu")
+	must(t, out, err, "hawser wsl-integrate --remove")
+	if _, err := run(t, 30*time.Second, "wsl.exe", "-d", "Ubuntu",
+		"--", "test", "-f", "/etc/profile.d/hawser.sh"); err == nil {
+		t.Error("profile script still present after --remove")
 	}
 }
 
