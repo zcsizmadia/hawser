@@ -183,7 +183,8 @@ func Relay(client, engine io.ReadWriteCloser) error {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(engine, client)
+		n, err := io.Copy(engine, client)
+		trace("relay c->e done n=%d err=%v", n, err)
 		errs[0] = err
 		if err != nil {
 			// The client died rather than half-closing: nothing is waiting for
@@ -198,9 +199,19 @@ func Relay(client, engine io.ReadWriteCloser) error {
 	}()
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(client, engine)
+		n, err := io.Copy(client, engine)
+		trace("relay e->c done n=%d err=%v", n, err)
 		errs[1] = err
-		closeWrite(client)
+		// The engine finishing the stream is the end of the conversation, and
+		// it must arrive at the client as a full close: winio named pipes have
+		// no half-close, so a CloseWrite here is a silent no-op and the client
+		// blocks forever waiting for an EOF that never comes. That was the
+		// `docker run --rm` never-exits hang — the container finished, dockerd
+		// closed the attach stream, and the CLI waited on a pipe nobody would
+		// ever close. Closing both sides also unblocks the client→engine copy
+		// above, so the relay unwinds instead of waiting on a dead client.
+		client.Close()
+		engine.Close()
 	}()
 	wg.Wait()
 
@@ -225,5 +236,16 @@ func filterClosed(err error) error {
 		errors.Is(err, io.ErrClosedPipe) {
 		return nil
 	}
+	// Platform-specific "went away normally" errors, registered from the
+	// platform files: winio's ErrFileClosed is what a named pipe returns when
+	// the relay itself closes the other direction.
+	for _, e := range platformClosedErrors {
+		if errors.Is(err, e) {
+			return nil
+		}
+	}
 	return err
 }
+
+// platformClosedErrors is appended to by platform-specific files.
+var platformClosedErrors []error

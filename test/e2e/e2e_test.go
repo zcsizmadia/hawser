@@ -1,0 +1,554 @@
+//go:build e2e
+
+// Package e2e is the v0.1 acceptance suite (#11).
+//
+// It drives the real hawser.exe against the real published rootfs on a real
+// Windows machine with WSL2 — the class of testing that found all ten of the
+// defects the unit tests could not (see #38 for the tally). It deliberately
+// shells out to the same binaries a user runs rather than importing internal
+// packages: the product is the CLI contract, so that is what gets tested.
+//
+// Run on any Windows machine with WSL2 and a docker CLI:
+//
+//	cd test/e2e && go test -tags e2e -timeout 30m -v .
+//
+// The suite installs into an isolated distro and state dir, and removes both;
+// a failure can leave the distro behind, in which case
+// `hawser uninstall --state-dir <printed dir> --yes` cleans up.
+package e2e
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+const (
+	distro   = "hawser-e2e-suite"
+	pipeName = `\\.\pipe\hawser-e2e-suite`
+	// dockerHost matches pipeName in the form the docker CLI wants.
+	dockerHost = "npipe:////./pipe/hawser-e2e-suite"
+)
+
+// state carries everything the ordered stages share.
+type state struct {
+	workDir  string // parent-scoped scratch: subtest TempDirs die with the subtest
+	hawser   string // built hawser.exe
+	docker   string // resolved docker CLI
+	stateDir string
+	dataDir  string
+	proxy    *exec.Cmd
+	proxyLog *os.File
+
+	// baselines captured before anything runs, compared after teardown.
+	wslProcsBefore int
+	ddWorkedBefore bool
+}
+
+// TestAcceptance is one ordered scenario, not independent tests: install must
+// precede use, use must precede uninstall, and the teardown assertions are
+// meaningless unless the earlier stages actually ran. Sub-tests give per-stage
+// reporting while a stage failure stops the sequence.
+func TestAcceptance(t *testing.T) {
+	if os.Getenv("OS") != "Windows_NT" {
+		t.Skip("acceptance runs on Windows with WSL2")
+	}
+	s := &state{workDir: t.TempDir()}
+
+	// Resolved up front so a missing CLI skips the suite rather than failing a
+	// later stage: a skip inside a sub-stage does not stop the sequence.
+	s.docker = findDocker()
+	if s.docker == "" {
+		t.Skip("no docker CLI found on PATH or in the usual install locations")
+	}
+
+	stages := []struct {
+		name string
+		fn   func(t *testing.T, s *state)
+	}{
+		{"Baselines", stageBaselines},
+		{"BuildHawser", stageBuild},
+		{"InstallFromPublishedRelease", stageInstall},
+		{"StartProxy", stageProxy},
+		{"HelloWorld", stageHelloWorld},
+		{"BindMountReadThroughContainer", stageBindMount},
+		{"ExecInRunningContainer", stageExec},
+		{"LogsFollowStreams", stageLogsFollow},
+		{"ComposeStack", stageCompose},
+		{"InterruptedClientDoesNotWedgeBridge", stageInterrupt},
+		{"Uninstall", stageUninstall},
+		{"NothingLeftBehind", stageClean},
+		{"DockerDesktopStillWorks", stageDesktopIntact},
+	}
+
+	// Teardown runs even on failure, so a broken run does not strand a distro.
+	t.Cleanup(func() { forceCleanup(s) })
+
+	for _, st := range stages {
+		if !t.Run(st.name, func(t *testing.T) { st.fn(t, s) }) {
+			t.Fatalf("stage %s failed; skipping the rest", st.name)
+		}
+	}
+}
+
+// run executes a command and returns trimmed combined output.
+func run(t *testing.T, timeout time.Duration, name string, args ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	done := make(chan struct{})
+	var out []byte
+	var err error
+	go func() {
+		out, err = cmd.CombinedOutput()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return strings.TrimSpace(string(out)), err
+	case <-time.After(timeout):
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		<-done
+		return strings.TrimSpace(string(out)), fmt.Errorf("%s timed out after %s", name, timeout)
+	}
+}
+
+func must(t *testing.T, out string, err error, what string) string {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("%s: %v\n%s", what, err, out)
+	}
+	return out
+}
+
+// dockerE runs docker against the suite's engine, never the user's default.
+func dockerE(t *testing.T, s *state, timeout time.Duration, args ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command(s.docker, args...)
+	cmd.Env = s.dockerEnv()
+	done := make(chan struct{})
+	var out []byte
+	var err error
+	go func() {
+		out, err = cmd.CombinedOutput()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return strings.TrimSpace(string(out)), err
+	case <-time.After(timeout):
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		<-done
+		return strings.TrimSpace(string(out)), fmt.Errorf("docker %s timed out after %s",
+			strings.Join(args, " "), timeout)
+	}
+}
+
+func wslProcCount(t *testing.T) int {
+	t.Helper()
+	out, _ := run(t, 30*time.Second, "tasklist", "/FI", "IMAGENAME eq wsl.exe", "/FO", "CSV", "/NH")
+	if strings.Contains(out, "No tasks") {
+		return 0
+	}
+	return len(strings.Split(out, "\n"))
+}
+
+func stageBaselines(t *testing.T, s *state) {
+	if out, err := run(t, 30*time.Second, s.docker, "--version"); err != nil {
+		t.Skipf("no docker CLI on PATH (%v: %s); the suite drives the engine through it", err, out)
+	}
+	s.wslProcsBefore = wslProcCount(t)
+	t.Logf("wsl.exe baseline: %d", s.wslProcsBefore)
+
+	// Whether Docker Desktop worked BEFORE decides whether the intact-after
+	// stage can claim anything. Recorded, not required.
+	if out, err := s.runDocker(t, 60*time.Second, "--context", "desktop-linux", "version", "--format", "{{.Server.Version}}"); err == nil && out != "" {
+		s.ddWorkedBefore = true
+		t.Logf("Docker Desktop serving version %s", out)
+	} else {
+		t.Log("Docker Desktop not responding before the suite; the intact-check will be skipped")
+	}
+}
+
+func stageBuild(t *testing.T, s *state) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.hawser = filepath.Join(s.workDir, "hawser.exe")
+	cmd := exec.Command("go", "build", "-o", s.hawser, "./cmd/hawser")
+	cmd.Dir = repoRoot
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("building hawser.exe: %v\n%s", err, out)
+	}
+}
+
+func stageInstall(t *testing.T, s *state) {
+	s.stateDir = filepath.Join(s.workDir, "state")
+	s.dataDir = filepath.Join(s.workDir, "data")
+
+	// No rootfs flags: this installs what a user installs, verifying the
+	// embedded manifest against the published release asset.
+	out, err := run(t, 10*time.Minute, s.hawser, "install",
+		"--distro", distro, "--state-dir", s.stateDir, "--data-dir", s.dataDir, "--headless")
+	must(t, out, err, "hawser install")
+
+	if !strings.Contains(out, "installed and running") {
+		t.Errorf("install output does not report success:\n%s", out)
+	}
+}
+
+func stageProxy(t *testing.T, s *state) {
+	logPath := filepath.Join(s.stateDir, "proxy-e2e.log")
+	f, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.proxyLog = f
+
+	// The suite's own pipe, so a Hawser or Docker Desktop already on the
+	// machine is neither disturbed nor accidentally tested.
+	s.proxy = exec.Command(s.hawser, "proxy",
+		"--distro", distro, "--state-dir", s.stateDir,
+		"--pipe", pipeName, "--no-context")
+	s.proxy.Stdout = f
+	s.proxy.Stderr = f
+	if err := s.proxy.Start(); err != nil {
+		t.Fatalf("starting proxy: %v", err)
+	}
+
+	// Up when the engine answers, not when the process exists.
+	deadline := time.Now().Add(2 * time.Minute)
+	for time.Now().Before(deadline) {
+		if out, err := dockerE(t, s, 15*time.Second, "version", "--format", "{{.Server.Version}}"); err == nil && out != "" {
+			t.Logf("engine answering: server %s", out)
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	log, _ := os.ReadFile(logPath)
+	t.Fatalf("engine never answered through the pipe. Proxy log:\n%s", log)
+}
+
+func stageHelloWorld(t *testing.T, s *state) {
+	out, err := dockerE(t, s, 5*time.Minute, "run", "--rm", "hello-world")
+	must(t, out, err, "docker run hello-world")
+	if !strings.Contains(out, "Hello from Docker!") {
+		t.Errorf("unexpected hello-world output:\n%s", out)
+	}
+}
+
+func stageBindMount(t *testing.T, s *state) {
+	// The #7 chain end to end: a Windows path, rewritten by the proxy,
+	// automounted by WSL, read by a container. Every link has failed at least
+	// once in isolation; this is the only test that exercises them together.
+	dir := t.TempDir()
+	const proof = "bind-mount-proof-e2e"
+	if err := os.WriteFile(filepath.Join(dir, "proof.txt"), []byte(proof), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := dockerE(t, s, 3*time.Minute, "run", "--rm",
+		"-v", dir+":/data:ro", "alpine:latest", "cat", "/data/proof.txt")
+	must(t, out, err, "bind mount read")
+	if !strings.Contains(out, proof) {
+		t.Errorf("container read %q, want %q — path translation or automount broke", out, proof)
+	}
+}
+
+func stageExec(t *testing.T, s *state) {
+	if out, err := dockerE(t, s, 2*time.Minute, "run", "-d", "--name", "e2e-exec",
+		"alpine:latest", "sleep", "300"); err != nil {
+		t.Fatalf("starting container: %v\n%s", err, out)
+	}
+	defer dockerE(t, s, time.Minute, "rm", "-f", "e2e-exec")
+
+	out, err := dockerE(t, s, time.Minute, "exec", "e2e-exec", "sh", "-c", "echo exec-$(hostname)")
+	must(t, out, err, "docker exec")
+	if !strings.HasPrefix(out, "exec-") {
+		t.Errorf("exec output = %q", out)
+	}
+	// A real interactive TTY (exec -it, Ctrl-C on logs -f) cannot be driven
+	// from a test binary without a ConPTY harness; that stays the documented
+	// manual check from #11.
+}
+
+func stageLogsFollow(t *testing.T, s *state) {
+	if out, err := dockerE(t, s, 2*time.Minute, "run", "-d", "--name", "e2e-logs",
+		"alpine:latest", "sh", "-c", "i=0; while true; do echo line-$i; i=$((i+1)); sleep 1; done"); err != nil {
+		t.Fatalf("starting logger: %v\n%s", err, out)
+	}
+	defer dockerE(t, s, time.Minute, "rm", "-f", "e2e-logs")
+
+	// Follow for a bounded window; receiving multiple distinct lines proves
+	// incremental streaming rather than buffer-until-close.
+	cmd := exec.Command(s.docker, "logs", "-f", "e2e-logs")
+	cmd.Env = s.dockerEnv()
+	var stderrBuf strings.Builder
+	cmd.Stderr = &stderrBuf
+	outPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
+
+	buf := make([]byte, 4096)
+	collected := ""
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) && strings.Count(collected, "line-") < 3 {
+		n, err := outPipe.Read(buf)
+		if n > 0 {
+			collected += string(buf[:n])
+		}
+		if err != nil {
+			break
+		}
+	}
+	if got := strings.Count(collected, "line-"); got < 3 {
+		t.Errorf("logs -f streamed %d lines in 20s, want >= 3:\n%s", got, collected)
+	}
+}
+
+func stageCompose(t *testing.T, s *state) {
+	if _, err := run(t, 30*time.Second, s.docker, "compose", "version"); err != nil {
+		t.Skip("docker compose plugin not available on this machine")
+	}
+
+	dir := t.TempDir()
+	// Healthcheck-gated depends_on and a Windows-path bind: the two compose
+	// behaviours PLAN §05 names, in the smallest stack that has both.
+	compose := `
+services:
+  db:
+    image: alpine:latest
+    command: sh -c "touch /tmp/ready && sleep 300"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 2s
+      retries: 15
+  app:
+    image: alpine:latest
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./shared:/shared
+    command: sh -c "cat /shared/input.txt && echo compose-ran > /shared/output.txt"
+`
+	if err := os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte(compose), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "shared"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "shared", "input.txt"), []byte("compose-input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	composeCmd := func(timeout time.Duration, args ...string) (string, error) {
+		cmd := exec.Command(s.docker, append([]string{"compose"}, args...)...)
+		cmd.Dir = dir
+		cmd.Env = s.dockerEnv()
+		done := make(chan struct{})
+		var out []byte
+		var err error
+		go func() { out, err = cmd.CombinedOutput(); close(done) }()
+		select {
+		case <-done:
+			return strings.TrimSpace(string(out)), err
+		case <-time.After(timeout):
+			if cmd.Process != nil {
+				cmd.Process.Kill()
+			}
+			<-done
+			return strings.TrimSpace(string(out)), fmt.Errorf("compose timed out after %s", timeout)
+		}
+	}
+
+	defer composeCmd(3*time.Minute, "down", "--timeout", "5")
+
+	out, err := composeCmd(5*time.Minute, "up", "--abort-on-container-exit", "--exit-code-from", "app")
+	must(t, out, err, "compose up")
+
+	got, err := os.ReadFile(filepath.Join(dir, "shared", "output.txt"))
+	if err != nil {
+		t.Fatalf("app never wrote through the bind mount: %v\ncompose output:\n%s", err, out)
+	}
+	if !strings.Contains(string(got), "compose-ran") {
+		t.Errorf("output.txt = %q", got)
+	}
+}
+
+func stageInterrupt(t *testing.T, s *state) {
+	// The #35 shape: kill a client mid-request, then prove the bridge still
+	// answers. The leak itself is bounded rather than fixed until the v0.2
+	// agent, so the assertion here is responsiveness, not process count.
+	cmd := exec.Command(s.docker, "logs", "-f", "nonexistent-will-wait")
+	cmd.Env = s.dockerEnv()
+	long := exec.Command(s.docker, "run", "--rm", "alpine:latest", "sleep", "30")
+	long.Env = s.dockerEnv()
+	if err := long.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * time.Second)
+	long.Process.Kill()
+	long.Wait()
+
+	out, err := dockerE(t, s, time.Minute, "version", "--format", "{{.Server.Version}}")
+	must(t, out, err, "engine after an interrupted client")
+	if out == "" {
+		t.Error("engine did not answer after a client was killed mid-run")
+	}
+}
+
+func stageUninstall(t *testing.T, s *state) {
+	// The proxy must not outlive the engine it serves.
+	if s.proxy != nil && s.proxy.Process != nil {
+		s.proxy.Process.Kill()
+		s.proxy.Wait()
+	}
+	if s.proxyLog != nil {
+		s.proxyLog.Close()
+	}
+
+	out, err := run(t, 5*time.Minute, s.hawser, "uninstall", "--state-dir", s.stateDir, "--yes")
+	must(t, out, err, "hawser uninstall")
+}
+
+func stageClean(t *testing.T, s *state) {
+	out, _ := run(t, 30*time.Second, "wsl.exe", "--list", "--quiet")
+	if strings.Contains(strings.ReplaceAll(out, "\x00", ""), distro) {
+		t.Errorf("distro %q still registered after uninstall", distro)
+	}
+	if _, err := os.Stat(s.dataDir); !os.IsNotExist(err) {
+		t.Errorf("data dir still present: %s", s.dataDir)
+	}
+	if _, err := os.Stat(filepath.Join(s.stateDir, "manifest.json")); !os.IsNotExist(err) {
+		t.Error("install manifest still present after uninstall")
+	}
+
+	// The bounded #35 leak means "returns to baseline" cannot be asserted yet;
+	// what can be is that the suite did not permanently double the population.
+	after := wslProcCount(t)
+	t.Logf("wsl.exe count: before=%d after=%d", s.wslProcsBefore, after)
+	if after > s.wslProcsBefore+3 {
+		t.Errorf("wsl.exe count grew from %d to %d; relay processes are leaking beyond the bound",
+			s.wslProcsBefore, after)
+	}
+}
+
+func stageDesktopIntact(t *testing.T, s *state) {
+	if !s.ddWorkedBefore {
+		t.Skip("Docker Desktop was not serving before the suite; nothing to compare against")
+	}
+	out, err := s.runDocker(t, 2*time.Minute, "--context", "desktop-linux", "run", "--rm", "hello-world")
+	if err != nil {
+		t.Fatalf("Docker Desktop broken after the suite: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Hello from Docker!") {
+		t.Errorf("Docker Desktop output unexpected:\n%s", out)
+	}
+}
+
+// forceCleanup removes whatever a failed run left, using the binary itself so
+// the cleanup path is also the product's own.
+func forceCleanup(s *state) {
+	if s.proxy != nil && s.proxy.Process != nil {
+		s.proxy.Process.Kill()
+		s.proxy.Wait()
+	}
+	if s.proxyLog != nil {
+		s.proxyLog.Close()
+	}
+	if s.hawser != "" && s.stateDir != "" {
+		exec.Command(s.hawser, "uninstall", "--state-dir", s.stateDir, "--yes").Run()
+	}
+	exec.Command("wsl.exe", "--unregister", distro).Run()
+}
+
+// findDocker resolves the docker CLI: PATH first, then where Docker Desktop
+// installs it. Test environments (notably Git Bash) often lack the PATH entry
+// while the binary is right there.
+func findDocker() string {
+	if p, err := exec.LookPath("docker"); err == nil {
+		return p
+	}
+	for _, c := range []string{
+		filepath.Join(os.Getenv("ProgramFiles"), "Docker", "Docker", "resources", "bin", "docker.exe"),
+	} {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+// dockerEnv builds the child environment for docker invocations: the suite's
+// engine selected, and the CLI's own directory on PATH. The latter matters
+// when docker was found outside PATH — its credential helper
+// (docker-credential-wincred) lives next to it and is resolved via PATH, and
+// without it every pull fails with "error getting credentials". The same fact
+// is why #9 bundles the helper alongside the CLI.
+func (s *state) dockerEnv() []string {
+	env := append(os.Environ(),
+		"DOCKER_HOST="+dockerHost,
+		"DOCKER_CONTEXT=",
+	)
+	dir := filepath.Dir(s.docker)
+	for i, kv := range env {
+		if strings.HasPrefix(strings.ToUpper(kv), "PATH=") {
+			env[i] = kv + string(os.PathListSeparator) + dir
+			return env
+		}
+	}
+	return append(env, "PATH="+dir)
+}
+
+// hostEnv is the environment for docker commands aimed at the machine's own
+// engines (Docker Desktop), not the suite's: PATH gains the CLI's directory so
+// its credential helper resolves, and no DOCKER_HOST override is applied.
+func (s *state) hostEnv() []string {
+	env := os.Environ()
+	dir := filepath.Dir(s.docker)
+	for i, kv := range env {
+		if strings.HasPrefix(strings.ToUpper(kv), "PATH=") {
+			env[i] = kv + string(os.PathListSeparator) + dir
+			return env
+		}
+	}
+	return append(env, "PATH="+dir)
+}
+
+// runDocker runs the docker CLI with hostEnv, for Desktop-facing checks.
+func (s *state) runDocker(t *testing.T, timeout time.Duration, args ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command(s.docker, args...)
+	cmd.Env = s.hostEnv()
+	done := make(chan struct{})
+	var out []byte
+	var err error
+	go func() { out, err = cmd.CombinedOutput(); close(done) }()
+	select {
+	case <-done:
+		return strings.TrimSpace(string(out)), err
+	case <-time.After(timeout):
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		<-done
+		return strings.TrimSpace(string(out)), fmt.Errorf("docker timed out after %s", timeout)
+	}
+}

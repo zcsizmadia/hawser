@@ -369,14 +369,23 @@ func TestRewriteFallsBackToRawOn101(t *testing.T) {
 	}
 }
 
-func TestRewriteFallsBackToRawOnRawStream200(t *testing.T) {
-	// Docker does not always answer with 101: without an upgrade request,
-	// attach returns 200 and then streams. Status code alone is not enough.
+func TestRewriteStreamContentTypeIsNotAHijack(t *testing.T) {
+	// The `docker logs` shape: a 200 whose Content-Type is a docker stream
+	// type but whose body is ordinary chunked HTTP carrying the multiplexed
+	// frames. Treating it as a hijack forwards the chunk framing as payload,
+	// which the CLI reads as a demux header and dies with
+	// "unrecognized stream: 102" ('f', a chunk-size line). The response must
+	// go through HTTP handling so the client's own dechunking works — and it
+	// must still arrive incrementally, since this is `logs -f`.
 	engine := newFakeEngine(t, func(_ int, w io.Writer, _ *http.Request) {
-		fmt.Fprint(w, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.multiplexed-stream\r\n\r\n")
-		if c, ok := w.(net.Conn); ok {
-			io.Copy(c, c)
+		fmt.Fprint(w, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.multiplexed-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+		for i := 0; i < 3; i++ {
+			// A realistic multiplexed frame: stdout, 7-byte payload.
+			frame := append([]byte{1, 0, 0, 0, 0, 0, 0, 7}, []byte(fmt.Sprintf("line-%d\n", i))...)
+			fmt.Fprintf(w, "%x\r\n%s\r\n", len(frame), frame)
+			time.Sleep(20 * time.Millisecond)
 		}
+		fmt.Fprint(w, "0\r\n\r\n")
 	})
 	addr, stop := startRewriteProxy(t, engine.dialer())
 	defer stop()
@@ -386,29 +395,30 @@ func TestRewriteFallsBackToRawOnRawStream200(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
+	fmt.Fprint(c, "GET /v1.55/containers/abc/logs?follow=1&stdout=1 HTTP/1.1\r\nHost: d\r\n\r\n")
 
-	fmt.Fprint(c, "POST /v1.55/containers/abc/attach?stream=1 HTTP/1.1\r\nHost: d\r\nContent-Length: 0\r\n\r\n")
-	br := bufio.NewReader(c)
 	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
 
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			t.Fatalf("read head: %v", err)
-		}
-		if strings.TrimSpace(line) == "" {
-			break
-		}
+	// Reading through the HTTP body must yield clean frames: the first byte of
+	// the first frame is the stream id (1 = stdout), NOT a chunk-size digit.
+	first := make([]byte, 8)
+	if _, err := io.ReadFull(resp.Body, first); err != nil {
+		t.Fatalf("read first frame header: %v", err)
 	}
-	if _, err := io.WriteString(c, "raw-bytes"); err != nil {
-		t.Fatalf("write: %v", err)
+	if first[0] != 1 {
+		t.Fatalf("first body byte = %#x, want 0x1 (stdout frame id); chunk framing leaked through", first[0])
 	}
-	buf := make([]byte, 9)
-	if _, err := io.ReadFull(br, buf); err != nil {
-		t.Fatalf("read: %v", err)
+	payload := make([]byte, 7)
+	if _, err := io.ReadFull(resp.Body, payload); err != nil {
+		t.Fatalf("read payload: %v", err)
 	}
-	if string(buf) != "raw-bytes" {
-		t.Errorf("got %q, want %q", buf, "raw-bytes")
+	if string(payload) != "line-0\n" {
+		t.Errorf("payload = %q, want %q", payload, "line-0\n")
 	}
 }
 

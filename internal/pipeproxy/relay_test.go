@@ -476,3 +476,57 @@ func TestRelayHalfClosesOnCleanClientEOF(t *testing.T) {
 		t.Errorf("got %q; a clean half-close must still receive the response", got)
 	}
 }
+
+func TestRelayClosesClientWhenEngineFinishes(t *testing.T) {
+	// The docker-run-never-exits hang: winio named pipes have no CloseWrite,
+	// so when the engine ends the stream, a half-close toward the client is a
+	// silent no-op and the client waits forever for an EOF that never comes.
+	// net.Pipe also lacks CloseWrite, which makes it the faithful stand-in.
+	//
+	// The engine sends a payload and closes; the client must observe EOF (a
+	// real close) promptly, and Relay itself must return rather than waiting
+	// on the client's send direction.
+	client, relaySide := net.Pipe()
+
+	engineClient, engineServer := net.Pipe()
+	go func() {
+		engineServer.Write([]byte("final bytes"))
+		engineServer.Close()
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- pipeproxy.Relay(relaySide, engineClient) }()
+
+	// Drain what the engine sent, then demand EOF.
+	buf := make([]byte, 64)
+	total := 0
+	deadline := time.Now().Add(5 * time.Second)
+	sawEOF := false
+	for time.Now().Before(deadline) {
+		client.SetReadDeadline(time.Now().Add(time.Second))
+		n, err := client.Read(buf[total:])
+		total += n
+		if err == io.EOF {
+			sawEOF = true
+			break
+		}
+		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			if total >= len("final bytes") {
+				sawEOF = true // a full close can surface as ErrClosedPipe on net.Pipe
+			}
+			break
+		}
+	}
+	if !sawEOF {
+		t.Fatal("client never saw the stream end; without CloseWrite support the close must be a full Close")
+	}
+	if got := string(buf[:total]); got != "final bytes" {
+		t.Errorf("client read %q before EOF, want %q", got, "final bytes")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Relay did not return after the engine finished; it must not wait on the client's send direction")
+	}
+}

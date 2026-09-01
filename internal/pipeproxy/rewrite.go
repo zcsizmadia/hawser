@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 
@@ -48,6 +49,7 @@ func RewriteBinds(client net.Conn, engine io.ReadWriteCloser) error {
 			}
 		}
 
+		trace("REQ %s %s", req.Method, req.URL.Path)
 		if err := req.Write(engine); err != nil {
 			return fmt.Errorf("forward request: %w", err)
 		}
@@ -56,6 +58,9 @@ func RewriteBinds(client net.Conn, engine io.ReadWriteCloser) error {
 		if err != nil {
 			return fmt.Errorf("read response: %w", err)
 		}
+		trace("RSP %d ct=%s cl=%d chunked=%v hijack=%v for %s",
+			resp.StatusCode, resp.Header.Get("Content-Type"), resp.ContentLength,
+			len(resp.TransferEncoding) > 0, isHijack(resp), req.URL.Path)
 
 		if isHijack(resp) {
 			// From here the connection carries a raw multiplexed stream, so
@@ -74,11 +79,22 @@ func RewriteBinds(client net.Conn, engine io.ReadWriteCloser) error {
 			return fmt.Errorf("forward response: %w", err)
 		}
 		resp.Body.Close()
+		trace("DONE %s (close=%v)", req.URL.Path, resp.Close || req.Close)
 
 		if resp.Close || req.Close {
 			return nil
 		}
 	}
+}
+
+// trace is debug logging for the relay and HTTP loop, enabled with
+// HAWSER_TRACE=1. It earned its keep diagnosing the docker-run-never-exits
+// hang (a winio pipe cannot half-close), so it stays.
+func trace(format string, args ...any) {
+	if os.Getenv("HAWSER_TRACE") == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "TRACE "+format+"\n", args...)
 }
 
 // containerCreatePath matches /containers/create with or without the version
@@ -89,26 +105,23 @@ func isContainerCreate(req *http.Request) bool {
 	return req.Method == http.MethodPost && containerCreatePath.MatchString(req.URL.Path)
 }
 
-// hijackContentTypes are the media types dockerd uses for raw and multiplexed
-// container streams. Docker does not always answer an upgrade with 101: when
-// the client does not request an upgrade, exec and attach return 200 and then
-// stream, so status code alone is not enough to detect a hijack.
-var hijackContentTypes = []string{
-	"application/vnd.docker.raw-stream",
-	"application/vnd.docker.multiplexed-stream",
-}
-
+// isHijack reports whether the connection stops being HTTP after this response.
+//
+// Only 101 Switching Protocols qualifies. An earlier version also treated the
+// docker stream content-types (application/vnd.docker.raw-stream,
+// .multiplexed-stream) as hijacks — and that corrupted `docker logs`: those
+// responses are ordinary HTTP whose *chunked body* carries the multiplexed
+// frames, so relaying them raw forwards the chunk framing as if it were
+// payload. The CLI then reads a chunk-size line as a demux header and dies
+// with "unrecognized stream: 102" — 102 being ASCII 'f', the chunk-size line
+// of a 15-byte log frame. Found by the e2e suite's logs -f stage.
+//
+// A 200-with-stream-content-type response (attach without an Upgrade header)
+// is forwarded as normal HTTP instead: the engine→client stream works, and
+// the client→engine direction of a non-upgraded attach is knowingly
+// unsupported — the docker CLI always upgrades for interactive use.
 func isHijack(resp *http.Response) bool {
-	if resp.StatusCode == http.StatusSwitchingProtocols {
-		return true
-	}
-	ct := resp.Header.Get("Content-Type")
-	for _, h := range hijackContentTypes {
-		if strings.HasPrefix(ct, h) {
-			return true
-		}
-	}
-	return false
+	return resp.StatusCode == http.StatusSwitchingProtocols
 }
 
 // rewriteCreateBody translates bind paths in a container-create request.
