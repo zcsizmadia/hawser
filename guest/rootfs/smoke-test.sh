@@ -77,7 +77,7 @@ echo "==> runtime dependencies the engine and bridge need at boot"
 # Absent from the Alpine minirootfs, and their absence only shows up when the
 # artifact is booted: no iptables means dockerd cannot build container
 # networking, no socat means the pipe relay has nothing to talk to.
-for dep in usr/bin/socat sbin/iptables sbin/ip6tables; do
+for dep in usr/bin/socat sbin/iptables sbin/ip6tables usr/local/bin/docker-init; do
     test -e "$work/$dep" || { echo "missing runtime dependency $dep"; exit 1; }
     echo "  ok $dep"
 done
