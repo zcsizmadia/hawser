@@ -1,0 +1,31 @@
+#!/bin/sh
+# Lint staged shell scripts before they can reach CI.
+# Enable once per clone:  git config core.hooksPath .githooks
+# Bypass deliberately:    git commit --no-verify
+set -eu
+
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep '\.sh$' || true)
+[ -z "$staged" ] && exit 0
+
+# -x follows `source=` directives, -P SCRIPTDIR resolves them next to each script.
+run_shellcheck() {
+    # scripts/install-tools.ps1 drops a copy here when it isn't on PATH.
+    local_sc="${LOCALAPPDATA:-}/hawser-tools/shellcheck.exe"
+    if command -v shellcheck >/dev/null 2>&1; then
+        shellcheck -x -P SCRIPTDIR "$@"
+    elif [ -x "$local_sc" ]; then
+        "$local_sc" -x -P SCRIPTDIR "$@"
+    elif command -v docker >/dev/null 2>&1; then
+        docker run --rm -v "$(pwd):/mnt" -w /mnt koalaman/shellcheck:stable -x -P SCRIPTDIR "$@"
+    else
+        echo "pre-commit: no shellcheck and no docker - skipping shell lint" >&2
+        return 0
+    fi
+}
+
+echo "pre-commit: shellcheck"
+# shellcheck disable=SC2086  # word splitting is how we pass the file list
+if ! run_shellcheck $staged; then
+    echo "pre-commit: shellcheck failed - fix, or commit with --no-verify" >&2
+    exit 1
+fi

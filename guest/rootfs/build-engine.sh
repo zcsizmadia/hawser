@@ -27,7 +27,9 @@ clone https://github.com/containerd/containerd.git "$CONTAINERD_VERSION" contain
 
 echo "--- moby (dockerd) $MOBY_TAG"
 clone https://github.com/moby/moby.git "$MOBY_TAG" moby
-(cd /src/moby && ./hack/make.sh binary-daemon && \
+# VERSION is what `dockerd --version` reports; without it moby stamps "dev",
+# which the smoke test rejects and `hawser version` would misreport.
+(cd /src/moby && VERSION="$ENGINE_VERSION" ./hack/make.sh binary-daemon && \
     find bundles -name dockerd -type f -exec cp {} /out/bin/ \;)
 
 echo "--- buildkit $BUILDKIT_VERSION"

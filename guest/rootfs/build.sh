@@ -34,6 +34,7 @@ echo "==> building engine binaries from source (this is the slow part)"
 docker run --rm \
   -v "$work:/out" \
   -e "MOBY_TAG=$MOBY_TAG" \
+  -e "ENGINE_VERSION=$ENGINE_VERSION" \
   -e "CONTAINERD_VERSION=$CONTAINERD_VERSION" \
   -e "RUNC_VERSION=$RUNC_VERSION" \
   -e "BUILDKIT_VERSION=$BUILDKIT_VERSION" \
