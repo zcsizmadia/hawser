@@ -73,16 +73,65 @@ func RewriteBinds(client net.Conn, engine io.ReadWriteCloser) error {
 		}
 
 		// resp.Write streams the body as it arrives, which is what keeps
-		// `docker logs -f` and pull progress incremental.
-		if err := resp.Write(client); err != nil {
+		// `docker logs -f` and pull progress incremental. But a streaming
+		// response also needs a watchdog on the client: with a quiet source
+		// (docker compose's /events subscription after the stack is down),
+		// resp.Write blocks reading the engine and never touches the dead
+		// client, so a vanished CLI would pin this relay open forever — found
+		// as "idle stop deferred: open client connections" (#41), the same
+		// half-open class as #35 on a new surface. The Peek doubles as the
+		// wait for the client's next request, so exactly one goroutine reads
+		// clientR at any moment.
+		peekc := make(chan error, 1)
+		go func() {
+			_, err := clientR.Peek(1)
+			peekc <- err
+		}()
+		writec := make(chan error, 1)
+		go func() { writec <- resp.Write(client) }()
+
+		var werr error
+		peeked := false
+		select {
+		case werr = <-writec:
+		case perr := <-peekc:
+			peeked = true
+			if perr != nil {
+				// Client is gone mid-stream. Closing the engine side unblocks
+				// resp.Write; an ordinary disconnect, not a fault.
+				engine.Close()
+				<-writec
+				resp.Body.Close()
+				trace("DONE %s (client vanished mid-stream)", req.URL.Path)
+				return nil
+			}
+			// Bytes arrived while the response still streams (a pipelined
+			// request): unusual for a docker client, but just wait the write
+			// out and loop.
+			werr = <-writec
+		}
+		if werr != nil {
 			resp.Body.Close()
-			return fmt.Errorf("forward response: %w", err)
+			return fmt.Errorf("forward response: %w", werr)
 		}
 		resp.Body.Close()
 		trace("DONE %s (close=%v)", req.URL.Path, resp.Close || req.Close)
 
 		if resp.Close || req.Close {
+			// The pending Peek goroutine unblocks when the caller closes the
+			// client conn; its channel is buffered, so nothing leaks.
 			return nil
+		}
+		if !peeked {
+			// Wait for the client's next move — its next request's first byte,
+			// or a close ending the keep-alive conversation — before looping,
+			// so ReadRequest never shares clientR with a still-blocked Peek.
+			if perr := <-peekc; perr != nil {
+				if errors.Is(perr, io.EOF) || errors.Is(perr, net.ErrClosed) {
+					return nil
+				}
+				return fmt.Errorf("await next request: %w", perr)
+			}
 		}
 	}
 }
