@@ -112,7 +112,21 @@ if (-not (Get-LocalUser $user -ErrorAction SilentlyContinue)) {
 }
 
 Write-Host "== granting user rights ==" -ForegroundColor Cyan
-Grant-UserRight -Account $user -Right 'SeServiceLogonRight'
+# SeServiceLogonRight is the obvious one. The other two are not:
+#
+# Creating the WSL utility VM goes through the Host Compute Service, which
+# failed with Wsl/Service/RegisterDistro/CreateVm/HCS/0x80070569 -
+# ERROR_LOGON_TYPE_NOT_GRANTED - when the account held only the service right.
+# HCS constructs the VM against a user token that needs batch (and on some
+# builds interactive) logon rights, even though nobody ever logs on
+# interactively. Granting them is what this run tests.
+#
+# Each of these is a real privilege being handed to a service account, so
+# whichever ones turn out to be necessary become documented requirements of the
+# v0.2 installer rather than something it does quietly.
+foreach ($right in 'SeServiceLogonRight', 'SeBatchLogonRight', 'SeInteractiveLogonRight') {
+    Grant-UserRight -Account $user -Right $right
+}
 
 # Stage the rootfs somewhere the account can read, and give it a writable place
 # for the VHDX. Without this the import fails on permissions rather than on the

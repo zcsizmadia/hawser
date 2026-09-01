@@ -129,8 +129,9 @@ func probe() {
 	// needs stored-credential rights the account does not have), the service
 	// imports its own — which is also what `hawser install --headless` would
 	// have to do in production, so it is the more useful thing to measure.
+	var importOut string
 	if !visible && os.Getenv("HAWSER_SPIKE_ROOTFS") != "" {
-		visible = selfImport(d)
+		_, importOut = selfImport(d)
 		out, err = run("wsl.exe", "--list", "--verbose")
 		logEvent(event{Phase: "distro-visible-after-import", Detail: d,
 			Output: out, OK: boolp(err == nil && strings.Contains(out, d))})
@@ -143,14 +144,7 @@ func probe() {
 		// which is an outright refusal by WSL and nothing to do with per-user
 		// registration - reporting it as registration would have recorded the
 		// wrong conclusion in the issue.
-		detail := "target distro not visible to this account - per-user registration (HKCU\\...\\Lxss) is the likely blocker"
-		if strings.Contains(out, "WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED") ||
-			strings.Contains(out, "as local system is not supported") {
-			detail = "WSL refuses to run as LocalSystem (WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED): " +
-				"this account can never work, regardless of distro registration. " +
-				"A dedicated service account is the only remaining pattern."
-		}
-		logEvent(event{Phase: "conclusion", Detail: detail, OK: boolp(false)})
+		logEvent(event{Phase: "conclusion", Detail: diagnose(out, importOut), OK: boolp(false)})
 		return
 	}
 
@@ -187,13 +181,62 @@ func probe() {
 	logEvent(event{Phase: "socket-up", Output: out, OK: boolp(false)})
 }
 
+// diagnose names the actual cause of a failure instead of guessing one.
+//
+// Written as a table because the spike has already produced three different
+// causes that all surface as "the distro is not visible", and recording the
+// wrong one in the issue is worse than recording nothing. Each entry is a
+// signature this spike has genuinely observed.
+func diagnose(listOut, importOut string) string {
+	all := listOut + "\n" + importOut
+	signatures := []struct {
+		match  []string
+		detail string
+	}{
+		{
+			match: []string{"WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED", "as local system is not supported"},
+			detail: "WSL refuses to run as LocalSystem (WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED). " +
+				"That account can never work, regardless of registration. A dedicated " +
+				"service account is the only viable pattern.",
+		},
+		{
+			match: []string{"0x80070569", "not been granted the requested logon type"},
+			detail: "creating the WSL utility VM failed with ERROR_LOGON_TYPE_NOT_GRANTED " +
+				"(HCS/0x80070569). WSL itself runs under this account, so the blocker is a " +
+				"missing logon right, not the architecture: the Host Compute Service builds " +
+				"the VM against a user token needing batch (and possibly interactive) logon " +
+				"rights. Whichever are required become documented v0.2 installer steps.",
+		},
+		{
+			match: []string{"0x80070005", "Access is denied"},
+			detail: "access denied while registering the distro - check that the account can " +
+				"write the VHDX directory and read the rootfs.",
+		},
+		{
+			match: []string{"no installed distributions"},
+			detail: "this account has no distros registered, confirming per-user registration " +
+				"(HKCU\\...\\Lxss). The import must run as the service account, which is what " +
+				"self-import tests.",
+		},
+	}
+	for _, s := range signatures {
+		for _, m := range s.match {
+			if strings.Contains(all, m) {
+				return s.detail
+			}
+		}
+	}
+	return "target distro not visible to this account, cause not recognized - " +
+		"read the wsl-list and self-import-result output above"
+}
+
 // selfImport registers the distro under the account this process runs as.
 //
 // This is the decisive measurement of the spike: whether a non-interactive
 // service account in session 0 can provision a WSL distro at all. If it can,
 // the dedicated-account pattern works and `hawser install --headless` knows
 // what it has to do; if it cannot, session-0 operation is off the table.
-func selfImport(d string) bool {
+func selfImport(d string) (bool, string) {
 	rootfs := os.Getenv("HAWSER_SPIKE_ROOTFS")
 	vhd := os.Getenv("HAWSER_SPIKE_VHD")
 	if vhd == "" {
@@ -202,14 +245,14 @@ func selfImport(d string) bool {
 	if err := os.MkdirAll(vhd, 0o755); err != nil {
 		logEvent(event{Phase: "self-import", Err: err.Error(), OK: boolp(false),
 			Detail: "could not create the VHDX directory"})
-		return false
+		return false, err.Error()
 	}
 
 	logEvent(event{Phase: "self-import", Detail: "importing " + d + " from " + rootfs})
 	out, err := run("wsl.exe", "--import", d, vhd, rootfs, "--version", "2")
 	logEvent(event{Phase: "self-import-result", Output: out, Err: errString(err),
 		OK: boolp(err == nil)})
-	return err == nil
+	return err == nil, out + " " + errString(err)
 }
 
 // heartbeat records socket health until told to stop. Reading these lines after
