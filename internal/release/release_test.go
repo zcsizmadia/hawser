@@ -76,6 +76,18 @@ func TestEmbeddedManifestMatchesRootfsPins(t *testing.T) {
 			t.Errorf("manifest %s = %q, versions.env %s = %q", component, got, envKey, want)
 		}
 	}
+
+	// The rootfs URL must point at the *revisioned* artifact
+	// (ENGINE_VERSION-ROOTFS_REVISION): a revision bump that forgets the
+	// manifest would otherwise keep installing the previous rootfs while
+	// `hawser version` claims the new one's contents.
+	if rev := pins["ROOTFS_REVISION"]; rev != "" {
+		wantName := "hawser-rootfs-" + pins["ENGINE_VERSION"] + "-" + rev + ".tar.gz"
+		if !strings.HasSuffix(e.Rootfs.URL, "/"+wantName) {
+			t.Errorf("manifest rootfs URL %q does not end in %q (versions.env ROOTFS_REVISION=%s)",
+				e.Rootfs.URL, wantName, rev)
+		}
+	}
 }
 
 func TestEngineSelectionIsExact(t *testing.T) {

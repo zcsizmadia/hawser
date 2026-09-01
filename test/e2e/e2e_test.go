@@ -80,6 +80,7 @@ func TestAcceptance(t *testing.T) {
 		{"LogsFollowStreams", stageLogsFollow},
 		{"ComposeStack", stageCompose},
 		{"InterruptedClientDoesNotWedgeBridge", stageInterrupt},
+		{"VsockPathServedEverything", stageVsockServed},
 		{"Uninstall", stageUninstall},
 		{"NothingLeftBehind", stageClean},
 		{"DockerDesktopStillWorks", stageDesktopIntact},
@@ -394,10 +395,14 @@ services:
 
 func stageInterrupt(t *testing.T, s *state) {
 	// The #35 shape: kill a client mid-request, then prove the bridge still
-	// answers. The leak itself is bounded rather than fixed until the v0.2
-	// agent, so the assertion here is responsiveness, not process count.
-	cmd := exec.Command(s.docker, "logs", "-f", "nonexistent-will-wait")
-	cmd.Env = s.dockerEnv()
+	// answers AND that nothing leaked. Under the v0.1 socat relay this stage
+	// could only assert responsiveness (the leak was bounded by an idle
+	// timeout, not fixed); with the vsock agent (#40) both ends of the
+	// transport are owned, a killed client's connection tears down
+	// explicitly, and the wsl.exe count must return to its pre-interrupt
+	// value — the regression #35 asked for.
+	before := wslProcCount(t)
+
 	long := exec.Command(s.docker, "run", "--rm", "alpine:latest", "sleep", "30")
 	long.Env = s.dockerEnv()
 	if err := long.Start(); err != nil {
@@ -411,6 +416,34 @@ func stageInterrupt(t *testing.T, s *state) {
 	must(t, out, err, "engine after an interrupted client")
 	if out == "" {
 		t.Error("engine did not answer after a client was killed mid-run")
+	}
+
+	// Teardown is not instantaneous; give it a moment, but far less than the
+	// 5-minute socat idle timeout that used to be the only backstop.
+	deadline := time.Now().Add(30 * time.Second)
+	after := wslProcCount(t)
+	for after > before && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+		after = wslProcCount(t)
+	}
+	if after > before {
+		t.Errorf("wsl.exe count %d did not return to the pre-interrupt %d; the interrupted client leaked its relay", after, before)
+	}
+}
+
+func stageVsockServed(t *testing.T, s *state) {
+	// The suite installed from the published release, so this asserts the
+	// shipping artifact chain end to end: the rootfs carries hawser-agent,
+	// the proxy's vsock dialer reached it, and no connection needed the socat
+	// fallback. The fallback logs one edge-triggered warning the moment it is
+	// first used; its absence over a suite's worth of traffic means the fast
+	// path served everything.
+	logBytes, err := os.ReadFile(filepath.Join(s.stateDir, "proxy-e2e.log"))
+	if err != nil {
+		t.Fatalf("reading proxy log: %v", err)
+	}
+	if strings.Contains(string(logBytes), "fallback transport") {
+		t.Error("proxy degraded to the socat fallback; the published rootfs should carry a reachable hawser-agent")
 	}
 }
 
