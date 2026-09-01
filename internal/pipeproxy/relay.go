@@ -54,9 +54,10 @@ type Server struct {
 	// Logger receives connection lifecycle events. Defaults to slog.Default().
 	Logger *slog.Logger
 
-	// OnAccept, if set, wraps each accepted connection before relaying. The
-	// HTTP-rewriting layer hooks in here, so the transport stays oblivious.
-	OnAccept func(client net.Conn) net.Conn
+	// Handler relays one accepted connection. Defaults to Relay, a byte-for-byte
+	// copy. RewriteBinds substitutes an HTTP-aware handler that translates
+	// Windows bind paths; the transport itself stays oblivious either way.
+	Handler func(client net.Conn, engine io.ReadWriteCloser) error
 
 	wg sync.WaitGroup
 
@@ -141,10 +142,6 @@ func (s *Server) handle(ctx context.Context, client net.Conn) {
 	s.track(client)
 	defer s.untrack(client)
 
-	if s.OnAccept != nil {
-		client = s.OnAccept(client)
-	}
-
 	engine, err := s.Dialer.Dial(ctx)
 	if err != nil {
 		// The client is left to see a closed connection; there is no HTTP
@@ -157,12 +154,19 @@ func (s *Server) handle(ctx context.Context, client net.Conn) {
 	s.track(engine)
 	defer s.untrack(engine)
 
-	if err := Relay(client, engine); err != nil {
-		log.Debug("relay ended", "error", err)
+	handler := s.Handler
+	if handler == nil {
+		// Relay accepts the more general io.ReadWriteCloser for its client, so
+		// it needs a thin adapter to fit the Handler signature.
+		handler = func(c net.Conn, e io.ReadWriteCloser) error { return Relay(c, e) }
+	}
+	if err := handler(client, engine); err != nil {
+		log.Debug("connection ended", "error", err)
 	}
 }
 
-// Relay copies bytes in both directions until both are done.
+// Relay copies bytes in both directions until both are done. It satisfies the
+// Server.Handler signature and is the default.
 //
 // Each direction propagates its own end-of-stream as a half-close rather than a
 // full close, so a client that finished sending can still read the response.
