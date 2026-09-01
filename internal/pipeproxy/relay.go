@@ -185,6 +185,15 @@ func Relay(client, engine io.ReadWriteCloser) error {
 		defer wg.Done()
 		_, err := io.Copy(engine, client)
 		errs[0] = err
+		if err != nil {
+			// The client died rather than half-closing: nothing is waiting for
+			// a response, and the engine side will not end on its own — socat
+			// does not exit when its stdin closes. Half-closing here would
+			// strand the other direction forever, leaking the relay process
+			// (#35), so tear the engine connection down instead.
+			engine.Close()
+			return
+		}
 		closeWrite(engine)
 	}()
 	go func() {

@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strconv"
+	"sync"
+	"time"
 )
 
 // WSLDialer reaches the engine socket by running socat inside the distro and
@@ -24,10 +27,52 @@ type WSLDialer struct {
 
 	// Exe overrides the wsl.exe path. Empty uses PATH.
 	Exe string
+
+	// IdleTimeout bounds how long socat will sit on a half-closed connection
+	// with no traffic. Zero uses DefaultIdleTimeout; negative disables it.
+	//
+	// This exists because socat does not exit when its stdin reaches EOF: it
+	// half-closes and waits on the other direction indefinitely. When a docker
+	// client is killed mid-request, that leaves socat — and the wsl.exe holding
+	// it — alive forever, and enough of them make the bridge stop responding
+	// (#35). The timeout is the backstop; the relay closes the engine promptly
+	// in the common case.
+	IdleTimeout time.Duration
 }
+
+// DefaultIdleTimeout is generous enough for a slow `docker build` upload to
+// pause without being torn down, and short enough that a leaked relay is
+// measured in minutes rather than for the life of the session.
+const DefaultIdleTimeout = 5 * time.Minute
 
 // DefaultSocketPath is where dockerd listens inside the Hawser distro.
 const DefaultSocketPath = "/var/run/docker.sock"
+
+func (d *WSLDialer) idleTimeout() time.Duration {
+	switch {
+	case d.IdleTimeout < 0:
+		return 0
+	case d.IdleTimeout == 0:
+		return DefaultIdleTimeout
+	default:
+		return d.IdleTimeout
+	}
+}
+
+// relayArgs builds the wsl.exe argument list for one relay.
+//
+// --exec skips the shell, so nothing re-interprets the socket path and there is
+// no shell process between us and socat.
+func (d *WSLDialer) relayArgs(socket string) []string {
+	args := []string{"-d", d.Distro, "-u", "root", "--exec", "socat"}
+	if t := d.idleTimeout(); t > 0 {
+		// -T is socat's inactivity timeout and applies to the half-closed
+		// state, which is exactly where a client that closed cleanly and then
+		// went away would otherwise strand it forever.
+		args = append(args, "-T", strconv.Itoa(int(t.Seconds())))
+	}
+	return append(args, "STDIO", "UNIX-CONNECT:"+socket)
+}
 
 // Dial starts the relay process and returns its stdio as a connection.
 func (d *WSLDialer) Dial(ctx context.Context) (io.ReadWriteCloser, error) {
@@ -43,13 +88,7 @@ func (d *WSLDialer) Dial(ctx context.Context) (io.ReadWriteCloser, error) {
 		exe = "wsl.exe"
 	}
 
-	// --exec skips the shell, so nothing re-interprets the socket path and
-	// there is no shell process between us and socat.
-	cmd := exec.CommandContext(ctx, exe,
-		"-d", d.Distro,
-		"-u", "root",
-		"--exec", "socat", "STDIO", "UNIX-CONNECT:"+socket,
-	)
+	cmd := exec.CommandContext(ctx, exe, d.relayArgs(socket)...)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -74,10 +113,13 @@ func (d *WSLDialer) Dial(ctx context.Context) (io.ReadWriteCloser, error) {
 // genuine half-close — socat sees EOF and shuts down its write side to the
 // engine socket, which is what makes request-body-then-read work.
 type procConn struct {
-	cmd  *exec.Cmd
-	in   io.WriteCloser
-	out  io.ReadCloser
-	done bool
+	cmd *exec.Cmd
+	in  io.WriteCloser
+	out io.ReadCloser
+	// Close can now arrive from two goroutines at once — the relay closes the
+	// engine when the client dies, and handle closes it again on the way out —
+	// so teardown has to be exactly-once rather than merely idempotent-ish.
+	once sync.Once
 }
 
 func (p *procConn) Read(b []byte) (int, error)  { return p.out.Read(b) }
@@ -89,16 +131,17 @@ func (p *procConn) CloseWrite() error { return p.in.Close() }
 // Close tears down the process and reaps it, so a busy client cannot leave a
 // trail of zombie wsl.exe processes behind.
 func (p *procConn) Close() error {
-	if p.done {
-		return nil
-	}
-	p.done = true
-
-	p.in.Close()
-	p.out.Close()
-	if p.cmd.Process != nil {
-		p.cmd.Process.Kill()
-	}
-	p.cmd.Wait()
+	p.once.Do(func() {
+		p.in.Close()
+		p.out.Close()
+		// Only ever this process's own child, by handle. Never by image name:
+		// Docker Desktop, Rancher and the user's own distros all run wsl.exe,
+		// and killing theirs leaves mounts behind that outlive the process
+		// (see the coexistence note on #35).
+		if p.cmd.Process != nil {
+			p.cmd.Process.Kill()
+		}
+		p.cmd.Wait()
+	})
 	return nil
 }
