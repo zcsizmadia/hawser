@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build & test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: gofmt
+        shell: pwsh
+        run: |
+          $bad = gofmt -l .
+          if ($bad) { Write-Host "gofmt needed:"; $bad; exit 1 }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./...
+
+      # The Spike A relay is a separate throwaway module — keep it compiling
+      # until the real pipeproxy replaces it, then this step goes away.
+      - name: build spike relay
+        working-directory: spike/a/relay
+        run: |
+          go mod tidy
+          go build ./...
