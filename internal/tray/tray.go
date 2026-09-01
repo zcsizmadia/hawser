@@ -1,0 +1,123 @@
+// Package tray holds the logic behind the Hawser system-tray status light,
+// separate from the GUI shell so it can be tested without a desktop.
+//
+// The tray is a status light, not a control panel (PLAN §03): a fixed, tiny
+// menu, and every item shells out to the `hawser` CLI — the tray itself holds
+// no engine logic and makes no decisions the CLI would not.
+package tray
+
+import (
+	"context"
+	"encoding/json"
+	"os/exec"
+	"strings"
+	"time"
+)
+
+// State is the engine state the dot reflects, mirroring `hawser status`.
+type State string
+
+const (
+	StateRunning      State = "running"
+	StateIdle         State = "idle"
+	StateStopped      State = "stopped"
+	StateNotInstalled State = "not-installed"
+	StateUnknown      State = "unknown"
+)
+
+// Status is the subset of `hawser status --json` the tray renders.
+type Status struct {
+	Installed  bool   `json:"installed"`
+	Engine     string `json:"engine"`
+	Supervisor string `json:"supervisor"`
+	Desired    string `json:"desired"`
+}
+
+// State collapses a Status into the dot's State.
+func (s Status) State() State {
+	if !s.Installed {
+		return StateNotInstalled
+	}
+	switch s.Engine {
+	case "running":
+		return StateRunning
+	case "idle":
+		return StateIdle
+	case "stopped":
+		return StateStopped
+	default:
+		return StateUnknown
+	}
+}
+
+// Tooltip is the one-line hover text for a state.
+func Tooltip(st State) string {
+	switch st {
+	case StateRunning:
+		return "Hawser — engine running"
+	case StateIdle:
+		return "Hawser — engine idle (starts on demand)"
+	case StateStopped:
+		return "Hawser — engine stopped"
+	case StateNotInstalled:
+		return "Hawser — not installed"
+	default:
+		return "Hawser — engine state unknown"
+	}
+}
+
+// Healthy reports whether the state should read as green: running or idle are
+// both "working as intended" (idle wakes on the next docker command).
+func Healthy(st State) bool { return st == StateRunning || st == StateIdle }
+
+// CLI runs the hawser binary for the tray. Exe is the resolved hawser.exe path.
+type CLI struct {
+	Exe string
+}
+
+// Poll asks the CLI for the current status. Any failure — CLI missing, not
+// installed, timeout — resolves to a definite State rather than an error, so
+// the dot always shows something honest.
+func (c CLI) Poll(ctx context.Context) Status {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, c.Exe, "status", "--json").Output()
+	if err != nil {
+		// `hawser status` exits non-zero when the engine is not running, but
+		// still prints valid JSON on stdout; parse it before giving up.
+		if len(out) == 0 {
+			return Status{}
+		}
+	}
+	var st Status
+	if json.Unmarshal(out, &st) != nil {
+		return Status{}
+	}
+	return st
+}
+
+// State is Poll collapsed to the dot state.
+func (c CLI) State(ctx context.Context) State { return c.Poll(ctx).State() }
+
+// Action is one menu command: a label and the CLI arguments it runs.
+type Action struct {
+	Label string
+	Args  []string
+}
+
+// Actions are the lifecycle items, each a thin CLI call. Kept as data so the
+// GUI shell only wires labels to Run and the mapping stays testable.
+var Actions = []Action{
+	{Label: "Start engine", Args: []string{"start"}},
+	{Label: "Stop engine", Args: []string{"stop"}},
+	{Label: "Restart engine", Args: []string{"restart"}},
+}
+
+// Run executes an action through the CLI and returns its combined output. The
+// tray shows failures as a notification rather than swallowing them.
+func (c CLI) Run(ctx context.Context, a Action) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, c.Exe, a.Args...).CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}

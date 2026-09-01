@@ -1,0 +1,109 @@
+# Running Hawser unattended (CI runners, build agents)
+
+Hawser's supervisor keeps the engine alive across crashes, `wsl --shutdown`,
+and sleep/resume — but it needs a **logged-on interactive session** to do it.
+This page documents how to give a headless machine one. It is documentation on
+purpose: Hawser will not set up auto-logon for you, because doing so means
+writing an account password into the machine's LSA secrets, and a tool that
+does that silently on your behalf is a liability a security review would
+rightly reject. You set it up, with eyes open, or you do not.
+
+## Why a session is required
+
+WSL2 will not create its utility VM from session 0 (a Windows service). This
+is a WSL platform constraint, not a Hawser one — it binds Docker Desktop and
+Rancher Desktop identically:
+
+- `LocalSystem` is refused outright (`WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`).
+- A dedicated service account fails inside the Host Compute Service with
+  `ERROR_LOGON_TYPE_NOT_GRANTED` even holding Service + Batch + Interactive
+  logon rights and local administrator.
+
+So an unattended machine needs a real user session. In practice that means
+auto-logon: the machine boots, logs a chosen user in, and Hawser's supervisor
+starts with that session (via the per-user autostart entry, below).
+
+> The session-0 findings above are marked provisional in the plan (Spike B,
+> issue #3) pending a re-test on a clean VM. Until that lands, treat auto-logon
+> as the supported path for unattended machines.
+
+## The playbook
+
+### 1. Create a dedicated local account
+
+Use a purpose-made low-privilege local account for the runner, not a personal
+or domain admin account. Auto-logon stores this account's password on the
+machine; scope the blast radius accordingly.
+
+```powershell
+# Elevated PowerShell
+$pw = Read-Host -AsSecureString "Password for the runner account"
+New-LocalUser -Name "hawser-runner" -Password $pw -PasswordNeverExpires
+Add-LocalGroupMember -Group "Users" -Member "hawser-runner"
+```
+
+Local administrator is **not** required for Hawser itself (install runs
+non-admin). Add it only if your CI jobs need it.
+
+### 2. Install Hawser as that user
+
+Log in as `hawser-runner` once, interactively, and install. This registers the
+per-user autostart entry so the supervisor starts at every logon:
+
+```powershell
+hawser install --headless
+hawser autostart status   # should report enabled
+```
+
+`hawser autostart` uses the per-user `Run` key and launches the windowless
+`hawserw.exe`, which starts `hawser supervise` — an interactive-session
+process, which is exactly what WSL2 needs. (A scheduled task set to "run
+whether logged on or not" performs a batch logon into session 0, where WSL
+cannot start; that is why Hawser uses the Run key, not a task.)
+
+### 3. Enable auto-logon
+
+Use Sysinternals **Autologon** (recommended: it stores the password in an LSA
+secret rather than plain text in the registry):
+
+```
+autologon.exe hawser-runner <domain-or-machine> <password>
+```
+
+The registry alternative (`DefaultUserName` / `DefaultPassword` under
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`) stores the
+password **in clear text** and should be avoided.
+
+### 4. (Optional) Lock the session after logon
+
+If the machine sits in the open, auto-logon then immediately lock keeps the
+desktop from being usable while the session — and therefore the engine — stays
+alive. Add a per-user startup entry:
+
+```
+%SystemRoot%\System32\rundll32.exe user32.dll,LockWorkStation
+```
+
+Locking does not stop the supervisor; the session remains logged on.
+
+### 5. Verify
+
+Reboot. With no interactive login, from an SSH session or a remote build step:
+
+```powershell
+docker version          # the engine answers
+hawser status --json    # "supervisor":"running","engine":"running"
+```
+
+## Security notes
+
+- Auto-logon means the machine boots into a usable (or lockable) session with a
+  stored credential. Treat the machine as holding that credential: restrict
+  physical and RDP access, and prefer a dedicated account with only the rights
+  the runner needs.
+- Combine with an idle timeout (`hawser config set idle-timeout 30m`) so an
+  unattended machine reclaims the engine's RAM between jobs; the next `docker`
+  command wakes it.
+- Nothing here is Hawser-specific plumbing — it is standard Windows unattended
+  configuration. Hawser only asks for the session it documents here; it never
+  creates it for you.
