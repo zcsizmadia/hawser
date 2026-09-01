@@ -54,3 +54,9 @@ func Listen(pipeName, sddl string) (net.Listener, error) {
 	}
 	return l, nil
 }
+
+func init() {
+	// What a winio pipe returns when the relay closes its other direction —
+	// ordinary shutdown, not a fault worth logging.
+	platformClosedErrors = append(platformClosedErrors, winio.ErrFileClosed)
+}
