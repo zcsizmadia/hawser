@@ -58,6 +58,15 @@ jobs:
       - name: smoke test the rootfs
         run: ./guest/rootfs/smoke-test.sh "$GITHUB_WORKSPACE/out"
 
+      # The smoke test checks the artifact's shape. These two check that it
+      # works and that it is complete — the gap that let a rootfs whose engine
+      # could not start reach a published release, twice.
+      - name: boot the engine
+        run: ./guest/rootfs/boot-test.sh "$GITHUB_WORKSPACE/out"
+
+      - name: compare against Docker's static bundle
+        run: ./guest/rootfs/reference-diff.sh "$GITHUB_WORKSPACE/out"
+
       - uses: actions/upload-artifact@v4
         with:
           name: hawser-rootfs
