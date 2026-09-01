@@ -64,5 +64,3 @@ tested matrix (PLAN §04).
 - `/etc/wsl.conf` — systemd off (Hawser's Windows service supervises dockerd instead),
   metadata on automounts, Windows PATH not appended into the distro
 - `/etc/hawser/engine-version` — what `hawser version` reports
-
-<!-- cache-hit verification: this file is not in the cache key -->
