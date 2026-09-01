@@ -82,6 +82,8 @@ Never an unauthenticated TCP daemon.
 
 **Supervisor — the always-on layer.** A supervisor process starts with the user's session and keeps the distro and dockerd alive: crash restart, recovery from `wsl --shutdown`, sleep/resume recovery. It runs headless — no UI, no tray required — so a CI runner needs no desktop app, only a session.
 
+> **PROVISIONAL — this conclusion is under re-test.** Spike B ran on a machine whose `SeServiceLogonRight` is missing `NT VIRTUAL MACHINE\Virtual Machines` (S-1-5-83-0), which is the *documented* cause of the very error it measured (`0x80070569`). Interactive WSL works there without the group, but a session-0 VM plausibly needs it, so the failure may be a fixable misconfiguration rather than a platform limit. Re-test belongs on a clean VM without a corporate security baseline. Treat everything below about session 0 as unconfirmed until then. See #3.
+
 It is *not* a session-0 Windows service, and cannot be: Spike B (#3) established that WSL2 will not create its utility VM outside an interactive session. `LocalSystem` is refused outright (`WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`), and a dedicated service account fails in the Host Compute Service with `ERROR_LOGON_TYPE_NOT_GRANTED` even holding Service, Batch and Interactive logon rights *and* local administrator. This is a WSL platform constraint, not a Hawser one — it binds Docker Desktop, Rancher and `wslc` identically. Unattended machines therefore need a logged-on session, which in practice means auto-logon (§06).
 
 **GUI — deliberately never.** Because Hawser serves the standard Docker API, every existing frontend just works: Portainer, lazydocker, Dockge, VS Code. The README shows the Portainer one-liner — converting "where's the GUI?" into a demo of the compatibility promise.
@@ -236,7 +238,9 @@ hawser status --json   # assert health, then every pipeline step just uses `dock
 
 What makes it first-class rather than incidental: unattended everything (no prompts, meaningful exit codes, `--json`), **version pinning as a contract** (no auto-updates unless asked — determinism is a direct anti-feature of Docker Desktop), **no desktop app required** — a headless supervisor rather than a tray application that pops update dialogs mid-pipeline, MSI/winget for fleet rollout, and pre-baked rootfs VHDX caching so ephemeral runners provision in seconds. GitLab's docker executor pointing at Hawser's pipe for Linux jobs on a Windows runner is a bonus scenario.
 
-**The session requirement, stated plainly.** Spike B (#3) settled this by measurement: **WSL2 cannot create its utility VM outside an interactive session.** `LocalSystem` is refused by name; a dedicated service account fails inside the Host Compute Service with `ERROR_LOGON_TYPE_NOT_GRANTED` even when granted Service, Batch and Interactive logon rights and made a local administrator. There is no privilege left to grant.
+**The session requirement — PROVISIONAL, see the note in §03.** The measurement below came from a machine missing `NT VIRTUAL MACHINE\Virtual Machines` from `SeServiceLogonRight`, a documented cause of the same error code. Until it is re-tested on a clean VM, treat this section as the pessimistic case rather than established fact. If the re-test passes, the original claim is restored and this section reverts.
+
+Spike B (#3) measured: **WSL2 cannot create its utility VM outside an interactive session.** `LocalSystem` is refused by name; a dedicated service account fails inside the Host Compute Service with `ERROR_LOGON_TYPE_NOT_GRANTED` even when granted Service, Batch and Interactive logon rights and made a local administrator. There is no privilege left to grant.
 
 So a runner needs a logged-on session, which for an unattended machine means **auto-logon of a dedicated account**, with Hawser starting at logon. After that one-time setup it is genuinely unattended: no prompts, no human present, reboots recover on their own.
 
