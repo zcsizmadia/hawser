@@ -78,6 +78,7 @@ func TestAcceptance(t *testing.T) {
 		{"HelloWorld", stageHelloWorld},
 		{"BindMountReadThroughContainer", stageBindMount},
 		{"ExecInRunningContainer", stageExec},
+		{"StdinPipeIntoContainer", stageStdinPipe},
 		{"LogsFollowStreams", stageLogsFollow},
 		{"ComposeStack", stageCompose},
 		{"WSLIntegrateSharesEngine", stageWSLIntegrate},
@@ -311,6 +312,59 @@ func stageExec(t *testing.T, s *state) {
 	// A real interactive TTY (exec -it, Ctrl-C on logs -f) cannot be driven
 	// from a test binary without a ConPTY harness; that stays the documented
 	// manual check from #11.
+}
+
+func stageStdinPipe(t *testing.T, s *state) {
+	// #57: piping into an interactive container must return, not hang. The CLI
+	// signals stdin-EOF by half-closing its named-pipe connection, which only
+	// works because the bridge serves the pipe in message mode; a byte-mode
+	// pipe swallows the CloseWrite and the container blocks on stdin forever.
+	// The bounded timeout in dockerStdin turns a regression into a failure
+	// rather than a hung suite.
+	const payload = "line-one\nline-two\nline-three\n"
+
+	got, err := dockerStdin(t, s, payload, 45*time.Second, "run", "-i", "--rm", "alpine:latest", "cat")
+	must(t, got, err, "docker run -i cat (stdin round-trip)")
+	if got != strings.TrimRight(payload, "\n") {
+		t.Errorf("run -i cat returned %q, want the piped payload", got)
+	}
+
+	// exec -i into a running container is the same half-close path.
+	if out, err := dockerE(t, s, 2*time.Minute, "run", "-d", "--name", "e2e-stdin",
+		"alpine:latest", "sleep", "300"); err != nil {
+		t.Fatalf("starting container: %v\n%s", err, out)
+	}
+	defer dockerE(t, s, time.Minute, "rm", "-f", "e2e-stdin")
+
+	got, err = dockerStdin(t, s, payload, 45*time.Second, "exec", "-i", "e2e-stdin", "wc", "-l")
+	must(t, got, err, "docker exec -i wc -l (stdin round-trip)")
+	if strings.TrimSpace(got) != "3" {
+		t.Errorf("exec -i wc -l counted %q lines, want 3 (stdin EOF did not propagate)", got)
+	}
+}
+
+// dockerStdin runs docker against the suite's engine with a string on stdin,
+// bounded by timeout so a stdin-EOF regression fails instead of hanging.
+func dockerStdin(t *testing.T, s *state, stdin string, timeout time.Duration, args ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command(s.docker, args...)
+	cmd.Env = s.dockerEnv()
+	cmd.Stdin = strings.NewReader(stdin)
+	done := make(chan struct{})
+	var out []byte
+	var err error
+	go func() { out, err = cmd.CombinedOutput(); close(done) }()
+	select {
+	case <-done:
+		return strings.TrimSpace(string(out)), err
+	case <-time.After(timeout):
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		<-done
+		return strings.TrimSpace(string(out)), fmt.Errorf("docker %s timed out after %s (stdin EOF likely not propagating)",
+			strings.Join(args, " "), timeout)
+	}
 }
 
 func stageLogsFollow(t *testing.T, s *state) {

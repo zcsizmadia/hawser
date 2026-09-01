@@ -45,10 +45,22 @@ func Listen(pipeName, sddl string) (net.Listener, error) {
 
 	l, err := winio.ListenPipe(pipeName, &winio.PipeConfig{
 		SecurityDescriptor: sddl,
-		// The engine API carries large payloads (image push/pull, build
-		// contexts); message mode would frame them wrongly. Byte mode is what
-		// dockerd's own Windows listener uses.
-		MessageMode: false,
+		// Message mode, for one specific reason: it is the only way a named
+		// pipe can carry a half-close. The docker CLI signals stdin-EOF on a
+		// hijacked interactive stream (docker run -i, exec -i, a pipe into a
+		// container) by calling CloseWrite on its connection; on a byte-mode
+		// winio pipe that is a silent no-op, so the container's stdin never
+		// ends and the command hangs forever (#57). In message mode winio
+		// implements CloseWrite as a zero-byte message the reader surfaces as
+		// io.EOF — which the relay already propagates to the engine.
+		//
+		// This does NOT reframe large payloads: winio presents a message-mode
+		// pipe as a byte stream for ordinary reads (it swallows
+		// ERROR_MORE_DATA), and a zero-length data write sends nothing, so
+		// only an explicit CloseWrite ever signals EOF. Image pull/push,
+		// build contexts and every hijack path are exercised by the
+		// acceptance suite under this mode.
+		MessageMode: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pipeproxy: listen %s: %w", pipeName, err)
