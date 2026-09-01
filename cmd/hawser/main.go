@@ -7,14 +7,71 @@ import (
 	"os"
 )
 
-// version is stamped by the release build (-ldflags "-X main.version=...").
-var version = "dev"
+// buildVersion is stamped by the release build (-ldflags "-X main.buildVersion=...").
+var buildVersion = "dev"
+
+// exit codes are part of the CLI contract: CI scripts branch on them, so they
+// are assigned deliberately rather than by accident (PLAN §03).
+const (
+	exitOK       = 0
+	exitError    = 1
+	exitUsage    = 2
+	exitNotFound = 3 // asked about something that is not installed
+)
+
+type command struct {
+	name    string
+	summary string
+	run     func(args []string) int
+}
+
+func commands() []command {
+	return []command{
+		{"version", "report every component version and which docker.exe is active", runVersion},
+	}
+}
+
+func usage(w *os.File) {
+	fmt.Fprintf(w, `hawser %s - upstream Docker Engine on Windows via WSL2
+
+usage: hawser <command> [flags]
+
+commands:
+`, buildVersion)
+	for _, c := range commands() {
+		fmt.Fprintf(w, "  %-10s %s\n", c.name, c.summary)
+	}
+	fmt.Fprintf(w, `
+Commands still in development are tracked at
+https://github.com/zcsizmadia/hawser/issues
+
+run `+"`hawser <command> --help`"+` for a command's flags
+`)
+}
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "version" {
-		fmt.Printf("hawser %s\n", version)
-		return
+	if len(os.Args) < 2 {
+		usage(os.Stderr)
+		os.Exit(exitUsage)
 	}
-	fmt.Fprintln(os.Stderr, "hawser: pre-alpha — see PLAN.md and ROADMAP.md")
-	os.Exit(1)
+
+	name := os.Args[1]
+	switch name {
+	case "-h", "--help", "help":
+		usage(os.Stdout)
+		os.Exit(exitOK)
+	case "-v", "--version":
+		// Convenience alias; `hawser version` is the real command.
+		name = "version"
+	}
+
+	for _, c := range commands() {
+		if c.name == name {
+			os.Exit(c.run(os.Args[2:]))
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "hawser: unknown command %q\n\n", name)
+	usage(os.Stderr)
+	os.Exit(exitUsage)
 }
