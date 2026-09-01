@@ -10,9 +10,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out="${1:?usage: smoke-test.sh <out-dir>}"
 # shellcheck source=versions.env
 . "$here/versions.env"
+rootfs_version="${ENGINE_VERSION}-${ROOTFS_REVISION}"
 
-tarball="$out/hawser-rootfs-${ENGINE_VERSION}.tar.gz"
-sbom="$out/hawser-rootfs-${ENGINE_VERSION}.spdx.json"
+tarball="$out/hawser-rootfs-${rootfs_version}.tar.gz"
+sbom="$out/hawser-rootfs-${rootfs_version}.spdx.json"
 
 echo "==> artifacts present"
 test -f "$tarball" || { echo "missing $tarball"; exit 1; }

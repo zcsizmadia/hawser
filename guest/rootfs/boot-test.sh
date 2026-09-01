@@ -23,8 +23,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out="${1:?usage: boot-test.sh <out-dir>}"
 # shellcheck source=versions.env
 . "$here/versions.env"
+rootfs_version="${ENGINE_VERSION}-${ROOTFS_REVISION}"
 
-tarball="$out/hawser-rootfs-${ENGINE_VERSION}.tar.gz"
+tarball="$out/hawser-rootfs-${rootfs_version}.tar.gz"
 test -f "$tarball" || { echo "missing $tarball"; exit 1; }
 
 image="hawser-boot-test:${ENGINE_VERSION}"

@@ -34,8 +34,8 @@ JSON
   "spdxVersion": "SPDX-2.3",
   "dataLicense": "CC0-1.0",
   "SPDXID": "SPDXRef-DOCUMENT",
-  "name": "hawser-rootfs-${ENGINE_VERSION}",
-  "documentNamespace": "https://github.com/zcsizmadia/hawser/spdx/rootfs-${ENGINE_VERSION}",
+  "name": "hawser-rootfs-${ENGINE_VERSION}-${ROOTFS_REVISION}",
+  "documentNamespace": "https://github.com/zcsizmadia/hawser/spdx/rootfs-${ENGINE_VERSION}-${ROOTFS_REVISION}",
   "creationInfo": {
     "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
     "creators": ["Tool: hawser-rootfs-build", "Organization: Hawser"]
@@ -49,6 +49,9 @@ JSON
   pkg "runc" "$RUNC_VERSION" "https://github.com/opencontainers/runc.git" "Apache-2.0"
   pkg "buildkit" "$BUILDKIT_VERSION" "https://github.com/moby/buildkit.git" "Apache-2.0"
   pkg "go" "$GO_VERSION" "https://go.dev/dl/" "BSD-3-Clause"
+  # The agent is versioned by this repository itself; the rootfs revision is
+  # its packaging version, and the git remote is its provenance.
+  pkg "hawser-agent" "rootfs-r${ROOTFS_REVISION}" "https://github.com/zcsizmadia/hawser.git" "Apache-2.0"
   cat <<'JSON'
 
   ]

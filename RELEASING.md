@@ -18,10 +18,17 @@ An app release embeds the rootfs checksum in
 [`internal/release/manifest.json`](internal/release/manifest.json). So the rootfs
 has to exist first:
 
-1. **Cut the rootfs release.** Tag `rootfs-v<engine-version>` — e.g.
-   `rootfs-v29.7.2`, matching `ENGINE_VERSION` in `guest/rootfs/versions.env`.
-   Publishing it triggers `rootfs.yml`, which rebuilds from source (or restores
-   the cached binaries), runs the smoke test, and attaches the three assets.
+1. **Cut the rootfs release.** Tag `rootfs-v<engine-version>-<revision>` —
+   e.g. `rootfs-v29.7.2-2`, matching `ENGINE_VERSION` and `ROOTFS_REVISION` in
+   `guest/rootfs/versions.env`. The revision exists because the tarball
+   carries more than the engine (hawser-agent, config, the Alpine userland):
+   it can change while the engine version stays put, and a published release's
+   assets must never be replaced — hawser builds already in the wild pin its
+   checksum. Bump the revision for a content change, reset it to 1 on an
+   engine bump. Publishing the tag triggers `rootfs.yml`, which rebuilds from
+   source (or restores the cached binaries), runs the smoke test, and attaches
+   the three assets. (The first release predates the scheme and is tagged bare
+   `rootfs-v29.7.2`.)
 2. **Copy the published checksum into the manifest.** Take the value from the
    uploaded `.sha256` and put it in `manifest.json` under
    `engines[].rootfs.sha256`, confirming the `url` matches the tag you used.
