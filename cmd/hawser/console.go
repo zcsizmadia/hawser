@@ -82,3 +82,7 @@ func emitJSON(v any) int {
 	}
 	return exitOK
 }
+
+// interruptCtx is a plain background context for short-lived setup calls that
+// should not be cancelled by the Ctrl-C that stops the long-running server.
+func interruptCtx() context.Context { return context.Background() }

@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/signal"
 
+	"github.com/zcsizmadia/hawser/internal/dockerctx"
+	"github.com/zcsizmadia/hawser/internal/pipeproxy"
 	"github.com/zcsizmadia/hawser/internal/provision"
 	"github.com/zcsizmadia/hawser/internal/release"
 )
@@ -126,20 +128,58 @@ flags:
 		return emitJSON(manifest)
 	}
 
+	// The context points at whichever pipe the bridge will serve, decided the
+	// same way `hawser proxy` decides it so the two cannot disagree.
+	pipe, pipeReason := pipeproxy.SelectPipeName("")
+	dockerHost := pipeproxy.DockerHostFor(pipe)
+
+	contextReady := false
+	mgr := &dockerctx.Manager{}
+	if err := mgr.Ensure(ctx, dockerHost); err != nil {
+		// A missing docker CLI is not a reason to fail a working install.
+		var noCLI *dockerctx.ErrNoDockerCLI
+		if errors.As(err, &noCLI) {
+			log.Warn("docker context not created", "reason", err)
+		} else {
+			log.Warn("could not wire the docker context", "error", err)
+		}
+	} else {
+		contextReady = true
+	}
+
 	fmt.Printf(`
 Engine installed and running.
 
   distro   %s
   engine   %s
   data     %s
+  pipe     %s  (%s)
 
-Next: point your docker client at it.
+`, manifest.Distro, manifest.EngineVersion, manifest.DataDir, pipe, pipeReason)
 
-  $env:DOCKER_HOST = "npipe:////./pipe/hawser_engine"
+	fmt.Printf(`Start the bridge, then use docker normally:
+
+  hawser proxy
+
+`)
+	if contextReady {
+		fmt.Printf(`In another shell:
+
+  docker --context %s run --rm hello-world
+
+Or make it the default for every shell:
+
+  docker context use %s
+
+`, dockerctx.Name, dockerctx.Name)
+	} else {
+		fmt.Printf(`Then point a docker client at it:
+
+  $env:DOCKER_HOST = "%s"
   docker run --rm hello-world
 
-A `+"`hawser` docker context and a bundled docker CLI are coming in #9;\nuntil then DOCKER_HOST is the way in.\n",
-		manifest.Distro, manifest.EngineVersion, manifest.DataDir)
+`, dockerHost)
+	}
 	return exitOK
 }
 
@@ -195,6 +235,19 @@ flags:
 
 	ctx, stop := interruptible()
 	defer stop()
+
+	// Remove the context before the distro: leaving a context pointed at a
+	// pipe nobody serves would make every later docker command fail, which is
+	// not "nothing else on the system was modified".
+	mgr := &dockerctx.Manager{}
+	if err := mgr.Remove(ctx, ""); err != nil {
+		var noCLI *dockerctx.ErrNoDockerCLI
+		if errors.As(err, &noCLI) {
+			log.Debug("no docker CLI, nothing to unwire", "reason", err)
+		} else {
+			log.Warn("could not remove the docker context", "error", err)
+		}
+	}
 
 	if err := p.Uninstall(ctx, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "hawser: %v\n", err)

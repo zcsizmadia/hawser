@@ -28,6 +28,7 @@ type command struct {
 func commands() []command {
 	return []command{
 		{"install", "provision the engine distro and start it", runInstall},
+		{"proxy", "serve the docker pipe and relay it to the engine (foreground)", runProxy},
 		{"uninstall", "remove the engine distro and Hawser's state", runUninstall},
 		{"version", "report every component version and which docker.exe is active", runVersion},
 	}
