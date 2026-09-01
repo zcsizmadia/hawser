@@ -23,8 +23,8 @@ Docker Desktop requires a paid subscription for most companies. Rancher Desktop 
 
 - Upstream Docker Engine (Linux containers) in a dedicated WSL2 distro
 - Named-pipe bridge so stock `docker.exe` works from any Windows shell — the real API, byte for byte
-- Lifecycle: install, autostart, crash recovery, sleep/resume survival, clean uninstall — as a real Windows service
-- Headless / CI mode: unattended install, JSON output, engine version pinning, no interactive session required
+- Lifecycle: install, autostart at logon, crash recovery, sleep/resume survival, clean uninstall — supervised, headless, no desktop app
+- Headless / CI mode: unattended install, JSON output, engine version pinning, no human interaction after setup (a logged-on session is required — see §06)
 - Desktop parity details: `host.docker.internal`, WSL distro integration, credential helper, volume path translation
 - Housekeeping: VHDX compaction, memory reclaim, engine upgrades with rollback
 - `doctor` — diagnoses WSL, VPN/DNS, proxy, and networking failures with actionable fixes
@@ -47,12 +47,12 @@ Scope discipline is the moat: the moment a Kubernetes checkbox or a management U
 
 ```
 ┌───────────────────────────── Windows host ─────────────────────────────┐
-│  single Go binary, three run modes (CLI / service / tray)              │
+│  single Go binary, three run modes (CLI / supervisor / tray)           │
 │                                                                        │
 │  Provisioner        Pipe proxy ★          Supervisor       Tray+doctor │
-│  rootfs download    \\.\pipe\docker_engine Windows service  status,    │
+│  rootfs download    \\.\pipe\docker_engine starts at logon, status,    │
 │  verify, wsl        ⇄ engine socket,      health, restart, start/stop, │
-│  --import           path translation      boot, no login   diagnostics │
+│  --import           path translation      sleep/resume    diagnostics  │
 │                                                                        │
 │   │ wsl.exe stdio relay (v0.1) → guest agent over AF_HYPERV vsock (v0.2)│
 │  ┌──────── WSL2 distro "hawser-engine" — Alpine rootfs ~80 MB ────────┐ │
@@ -80,7 +80,9 @@ Never an unauthenticated TCP daemon.
 
 **Tray — a status light, ≤ 6 items forever.** Status dot · Start/Stop/Restart · Open logs · Run doctor · Check updates · Quit. Each item invokes the CLI underneath. No settings dialogs, no container lists — that cap is a hard rule, because the tray is where scope creep would start.
 
-**Service — the always-on layer.** A real Windows service supervises the distro and dockerd: boot-time start without an interactive login, crash restart, sleep/resume recovery. The tray is optional garnish on top; on a CI runner the service runs with no UI at all.
+**Supervisor — the always-on layer.** A supervisor process starts with the user's session and keeps the distro and dockerd alive: crash restart, recovery from `wsl --shutdown`, sleep/resume recovery. It runs headless — no UI, no tray required — so a CI runner needs no desktop app, only a session.
+
+It is *not* a session-0 Windows service, and cannot be: Spike B (#3) established that WSL2 will not create its utility VM outside an interactive session. `LocalSystem` is refused outright (`WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`), and a dedicated service account fails in the Host Compute Service with `ERROR_LOGON_TYPE_NOT_GRANTED` even holding Service, Batch and Interactive logon rights *and* local administrator. This is a WSL platform constraint, not a Hawser one — it binds Docker Desktop, Rancher and `wslc` identically. Unattended machines therefore need a logged-on session, which in practice means auto-logon (§06).
 
 **GUI — deliberately never.** Because Hawser serves the standard Docker API, every existing frontend just works: Portainer, lazydocker, Dockge, VS Code. The README shows the Portainer one-liner — converting "where's the GUI?" into a demo of the compatibility promise.
 
@@ -151,7 +153,7 @@ CLI-only, end to end. This alone is shippable and useful — everything after it
 The "it just disappears" milestone: survives everything Windows throws at it without user action — including running with nobody logged in.
 
 - [ ] Windows service (`x/sys/windows/svc`): supervises the distro and dockerd, restarts on WSL crashes *and* user-initiated `wsl --shutdown`, starts at boot
-- [ ] Session-0 / no-login operation: run under a dedicated service account (or boot-time scheduled task with the account's token) so CI runners work unattended — Docker Desktop never solved this; solving it is a differentiator
+- [ ] Start-at-logon supervision so CI runners work unattended: the supervisor and pipe proxy start with the session, since WSL2 cannot be driven from session 0 (Spike B, #3). Document the auto-logon setup for headless runners rather than automating it — writing credentials into LSA secrets on a user's behalf is a liability a security review would rightly object to
 - [ ] Guest agent over AF_HYPERV vsock replaces per-connection spawning; latency parity with Docker Desktop
 - [ ] On-demand start + optional idle shutdown (`hawser config set idle-timeout 30m`): engine starts on first pipe connection (~2s cold start), stops when no containers run and the pipe is quiet — answers the #1 laptop complaint (idle RAM)
 - [ ] Sleep/resume and network-change recovery: re-verify socket health on power events, reconnect silently
@@ -160,13 +162,14 @@ The "it just disappears" milestone: survives everything Windows throws at it wit
 - [ ] Tray icon (6 items, forever): status dot, start/stop/restart, open logs, run doctor, quit
 - [ ] Structured logging to the Windows Event Log and a rotating file
 
-**Acceptance:** Kill `wsl.exe`, reboot, or sleep/resume — the next `docker ps` works with no user action. A service-account install runs with no user logged in.
+**Acceptance:** Kill `wsl.exe`, reboot, or sleep/resume — the next `docker ps` works with no user action. On a machine with auto-logon configured, a reboot brings the engine back and a container job runs with nobody physically present.
 
 ### v0.3 — Doctor, VPN & housekeeping (~3 weekends)
 
 The differentiator over DIY guides: turn the WSL2 quirk zoo — VPNs above all — from an issue-tracker flood into a diagnosable surface.
 
 - [ ] `hawser doctor`: WSL version, virtualization, VPN DNS breakage, pipe ACL/health, port conflicts, MTU/route reachability, disk usage — each with an actionable fix, not just a red X; `--report` emits markdown ready to paste into a GitHub issue
+- [ ] Session check in doctor: no interactive session means the engine cannot start at all (Spike B, #3). On a headless runner this is *the* first failure someone hits, and without a named check it looks like Hawser being broken — the remedy is the auto-logon setup from §06
 - [ ] Version-sanity checks in doctor: PATH shadowing (a foreign `docker.exe` resolving ahead of Hawser's while the `hawser` context is active), CLI↔engine API skew outside the tested matrix, agent/rootfs/app manifest mismatch after a partial upgrade
 - [ ] Prefer the platform fix for VPNs: apply `networkingMode=mirrored`, `dnsTunneling`, `autoProxy` where the Windows build supports them (global config → explicit consent)
 - [ ] VPN known-issues database: fingerprint GlobalProtect / AnyConnect / Zscaler patterns → named fix; fallbacks for hostile setups (static DNS pinning, MTU clamping, opt-in `hawser vpn-workaround` relay in the wsl-vpnkit style)
@@ -215,7 +218,7 @@ Boring on purpose: reliability guarantees, not features.
 - [ ] Compatibility matrix across Windows 11 23H2/24H2+ / Insider, plus Windows 10 22H2-under-ESU as best-effort (mirrored networking and several doctor fixes are Win11-only — the matrix says which); WSL version pinning policy
 - [ ] Semantic versioning, upgrade guarantees, published threat model for the pipe (so security teams can approve it)
 - [ ] Checkpoint: the concrete tripwire is **movement on microsoft/WSL#40976** (a Docker Engine API endpoint for wslc — today unanswered, no milestone), not wslc GA itself, which ships without it. A maintainer reply, a milestone, or a `settings.yaml` endpoint in release notes triggers a deliberate positioning review
-- [ ] Platform watch-list — wslc's under-the-hood work is WSL platform investment Hawser may inherit for free: adopt **virtiofs** file sharing the day it reaches standard distros (attacks the slow-9P bind-mount problem), fold **consomme networking** into `doctor --fix` as the preferred VPN remedy if exposed, and shrink `compact`/reclaim to a thin wrapper if the memory-reclaim improvements ship platform-wide
+- [ ] Platform watch-list — wslc's under-the-hood work is WSL platform investment Hawser may inherit for free: adopt **virtiofs** file sharing the day it reaches standard distros (attacks the slow-9P bind-mount problem), fold **consomme networking** into `doctor --fix` as the preferred VPN remedy if exposed, and shrink `compact`/reclaim to a thin wrapper if the memory-reclaim improvements ship platform-wide. Also watch for **WSL gaining service-context support**: it would restore true sessionless operation (§06) and remove the auto-logon requirement for every WSL-based engine at once
 
 **Acceptance:** Two consecutive Windows feature updates absorbed with zero breaking issues filed.
 
@@ -231,7 +234,15 @@ hawser install --headless --engine-version 27.5.1
 hawser status --json   # assert health, then every pipeline step just uses `docker`
 ```
 
-What makes it first-class rather than incidental: unattended everything (no prompts, meaningful exit codes, `--json`), **version pinning as a contract** (no auto-updates unless asked — determinism is a direct anti-feature of Docker Desktop), service operation with no logged-in user (the session-0 work in v0.2), MSI/winget for fleet rollout, and pre-baked rootfs VHDX caching so ephemeral runners provision in seconds. GitLab's docker executor pointing at Hawser's pipe for Linux jobs on a Windows runner is a bonus scenario.
+What makes it first-class rather than incidental: unattended everything (no prompts, meaningful exit codes, `--json`), **version pinning as a contract** (no auto-updates unless asked — determinism is a direct anti-feature of Docker Desktop), **no desktop app required** — a headless supervisor rather than a tray application that pops update dialogs mid-pipeline, MSI/winget for fleet rollout, and pre-baked rootfs VHDX caching so ephemeral runners provision in seconds. GitLab's docker executor pointing at Hawser's pipe for Linux jobs on a Windows runner is a bonus scenario.
+
+**The session requirement, stated plainly.** Spike B (#3) settled this by measurement: **WSL2 cannot create its utility VM outside an interactive session.** `LocalSystem` is refused by name; a dedicated service account fails inside the Host Compute Service with `ERROR_LOGON_TYPE_NOT_GRANTED` even when granted Service, Batch and Interactive logon rights and made a local administrator. There is no privilege left to grant.
+
+So a runner needs a logged-on session, which for an unattended machine means **auto-logon of a dedicated account**, with Hawser starting at logon. After that one-time setup it is genuinely unattended: no prompts, no human present, reboots recover on their own.
+
+This is a WSL constraint rather than a Hawser one, and it binds every alternative equally — Docker Desktop, Rancher Desktop and Microsoft's own `wslc` all need a session. An earlier draft of this plan claimed session-0 operation as a differentiator over Docker Desktop; that was wrong, and the measurement is in #3. The wedge does not depend on it: the pain being solved is licensing cost, mid-pipeline auto-updates, and non-determinism, none of which auto-logon touches.
+
+**The honest cost:** auto-logon stores the account password in LSA secrets, recoverable by an administrator. Organizations that forbid it by policy cannot run Hawser unattended at all — nor any WSL-based engine. That belongs in the docs, and in `doctor` as a named check rather than a mystery.
 
 Two boundaries, stated honestly: GitHub/GitLab *hosted* Windows runners cannot work (no nested virtualization — a hypervisor policy, not a software gap), and Hyper-V guest VMs used as runners need nested virtualization enabled on their host. Notably, Microsoft's `wslc` doesn't threaten this niche: CI workloads are exactly the Docker-API-dependent tools it can't run.
 
@@ -258,7 +269,7 @@ hawser/
 │   ├── engine/             # lifecycle, health checks, upgrade/rollback, API client
 │   ├── wsl/                # wsl.exe wrappers, .wslconfig, vhdx ops (mockable interface)
 │   ├── doctor/             # diagnostic checks, each check = one file + one test; VPN fingerprints
-│   ├── svc/                # Windows service glue, session-0 operation, power events
+│   ├── svc/                # supervisor: start-at-logon, power events, restart
 │   └── tray/               # systray UI (6 items max)
 ├── guest/
 │   ├── rootfs/             # Alpine build scripts → tar + SBOM (runs in CI)
@@ -277,7 +288,8 @@ The `wsl` package hides every `wsl.exe` invocation behind an interface so unit t
 |---|---|---|
 | Docker trademark | launch-blocking | No "docker" or whale in name/logo/package IDs (hence Hawser); nominative references only; ship CLI binaries unmodified under Apache-2.0; engine binaries built from source in CI, not repackaged from Docker's distribution channels. Legal sanity check before the repo goes public. |
 | Microsoft's wslc absorbs the niche | strategic | wslc (GA expected fall 2026) mimics the CLI but has no daemon and no API socket at all — compose, Testcontainers, and socket-mounting tools are architecturally out of reach, and the endpoint request (microsoft/WSL#40976) sits unanswered with no milestone. Ship v0.1 fast and own the "real Docker API" framing. If #40976 ever ships, the pre-thought pivot: Hawser's glue layer (doctor, service lifecycle, fleet policy, path-translating pipe) can sit on top of wslc's endpoint instead of its own distro. |
-| Session-0 / no-login WSL | technical | WSL2's utility VM is per-user and historically assumes a logged-on session; running it from a service is a known rough area. Week-1 spike (not v1.0 discovery); dedicated service-account pattern; boot-time scheduled task with the account's token as fallback. |
+| ~~Session-0 / no-login WSL~~ — **settled, and negative** | resolved | Spike B (#3) measured it: WSL2 will not create its utility VM outside an interactive session. LocalSystem is refused by name; a dedicated service account fails in HCS with `ERROR_LOGON_TYPE_NOT_GRANTED` holding Service + Batch + Interactive rights and local admin. No longer a risk but a documented constraint (§03, §06). Cost of finding out: one day, in week one, exactly as intended. |
+| Auto-logon forbidden by policy | medium | Unattended runners need a logged-on session, and auto-logon stores a password in LSA secrets. Fleets that ban it cannot run Hawser unattended — nor any WSL-based engine, so no competitor wins those machines either. Mitigation: state it in the docs, name it in `doctor`, and never automate credential storage on the user's behalf. Theoretical escape (out of scope): run the engine in a plain Hyper-V VM instead of WSL. |
 | WSL2 behavior drift | ongoing | Pin a minimum WSL version; doctor detects mismatches; abstract every `wsl.exe` call; test Insider builds before Windows feature updates land. |
 | CI can't run WSL2 | medium | GitHub-hosted Windows runners lack nested virtualization. Keep unit tests host-independent; one self-hosted runner (or a paid larger runner) for the e2e suite. |
 | SmartScreen / unsigned binaries | medium | Sign from the first public release (Azure Trusted Signing is ~$10/mo; SignPath is free for OSS); winget distribution builds reputation fastest. container-desktop's Defender-blocked installer is the cautionary tale. |
@@ -292,7 +304,7 @@ The `wsl` package hides every `wsl.exe` invocation behind an interface so unit t
 - **< 15 MB** — installed Windows-side footprint (vs ~500 MB incumbents)
 - **< 30 MB** — idle RAM of all Windows-side processes
 - **0 clicks** — recovery after reboot, sleep, or WSL crash
-- **0 prompts** — unattended install on a CI runner, no user logged in
+- **0 prompts** — unattended install and operation on a CI runner (a logged-on session is required; auto-logon covers it)
 
 ---
 
@@ -300,11 +312,11 @@ The `wsl` package hides every `wsl.exe` invocation behind an interface so unit t
 
 1. **Claim the name.** Hawser is chosen — reserve the GitHub org, winget/scoop/choco IDs, and a domain; quick USPTO/EUIPO sanity search. Then never revisit.
 2. **Manual spike — prove the whole path by hand.** Import a hand-built Alpine+dockerd tar, relay the pipe with a throwaway script, run `docker ps` from PowerShell. Every architectural risk surfaces here, before any real code exists.
-3. **Session-0 spike.** Start WSL2 + dockerd from a Windows service with no user logged in (dedicated service account; scheduled-task fallback). This is the CI use case's one real unknown — settle it now, not in v1.0.
+3. ~~**Session-0 spike.**~~ **Done (#3): negative.** WSL2 will not create its utility VM outside an interactive session, under any account or privilege set. The CI story now rests on auto-logon, and §06 says so plainly.
 4. **Repo + CI skeleton.** Apache-2.0, Go module, lint/test workflow, and the rootfs build pipeline publishing a checksummed tar + SBOM as a release asset.
 5. **Pipe proxy in Go.** `go-winio` server + per-connection relay, with tests covering half-close, hijacked streams (`exec -it`), path translation, and concurrent connections.
 6. **Wrap it: `hawser install`.** Provisioner + context wiring, tested on a clean Windows 11 VM. That's v0.1 within reach.
 
 ---
 
-*draft 6 · 2026-08-31 · plan owner: zcsizmadia · name settled: Hawser · wslc tripwire: microsoft/WSL#40976 · execution detail: ROADMAP.md · next review: after the manual + session-0 spikes*
+*draft 7 · 2026-09-01 · plan owner: zcsizmadia · name settled: Hawser · wslc tripwire: microsoft/WSL#40976 · execution detail: ROADMAP.md · spikes A+B settled (#2 GO, #3 NO-GO) · next review: after v0.1 acceptance*

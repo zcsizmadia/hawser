@@ -14,11 +14,11 @@ Everything here either de-risks the architecture or claims ground that gets more
 |---|---|---|---|
 | 0.1 | Reserve the name: GitHub org, winget/scoop/choco IDs, domain, USPTO/EUIPO sanity search | reservations done | — |
 | 0.2 | **Spike A — manual end-to-end**: hand-built Alpine+dockerd tar, `wsl --import`, throwaway pipe relay script, `docker ps` from PowerShell (download.docker.com static bundle OK here only) | written spike notes: latency, half-close behavior, gotchas | **GO/NO-GO: the path works at all** |
-| 0.3 | **Spike B — session-0**: start WSL2 + dockerd from a Windows service with no user logged in; try dedicated service account, then boot scheduled task with stored token | which pattern works, on which Windows builds | **GO/NO-GO for the CI market claim** |
+| 0.3 | ~~**Spike B — session-0**~~ **DONE (#3): NO-GO.** WSL2 will not create its utility VM outside an interactive session — LocalSystem refused by name, a dedicated account fails in HCS with `ERROR_LOGON_TYPE_NOT_GRANTED` even holding Service+Batch+Interactive rights and local admin | the constraint, measured | CI story now rests on auto-logon; PLAN §03/§06/§09 rewritten |
 | 0.4 | Repo skeleton: Apache-2.0, Go module, lint/test workflow, layout from PLAN §08 | pushable repo (private) | — |
 | 0.5 | Rootfs CI pipeline v0: Alpine + engine **built from moby/containerd/runc source**, tar + SHA256 + SBOM as release asset | reproducible rootfs artifact | blocks 1.2 |
 
-**Gate outcomes.** Spike A failing means the architecture is wrong — stop and rethink (very unlikely; the DIY guides prove it daily). Spike B failing on all patterns doesn't kill the project — it demotes "no-login CI runner" from headline to "requires auto-logon workaround," and PLAN §06 gets rewritten honestly. Decide *now*, not at v1.0.
+**Gate outcomes — both settled in week one, as intended.** Spike A: **GO**, the architecture works end to end. Spike B: **NO-GO**, and exactly the outcome this gate existed to catch — "no-login CI runner" is demoted to "requires auto-logon," and PLAN §03/§06/§09 were rewritten to say so. The finding cost a day; discovering it during v0.2 would have cost a rewrite of the service architecture, and discovering it after launch would have cost credibility.
 
 ---
 
@@ -46,22 +46,22 @@ Goal: CLI-only, fresh Windows 11 VM → `docker run hello-world` in <5 min. Ship
 
 ## v0.2 — Always-on (3 weekends → target **Sun Nov 8, 2026**)
 
-Goal: survives everything Windows throws at it, including nobody logged in. This is the milestone that makes the CI claim real.
+Goal: survives everything Windows throws at it, within a logged-on session. This is the milestone that makes the CI claim real — with the session caveat Spike B established.
 
 | Weekend | Work | Depends on |
 |---|---|---|
-| W4 (Oct 10–11) | Windows service (`x/sys/windows/svc`): supervise distro + dockerd, restart on crash and on user `wsl --shutdown`, boot start; structured logging (Event Log + rotating file) | v0.1 |
-| W5 (Oct 17–18) | Session-0 productization per Spike B's winning pattern; sleep/resume + network-change recovery (power events → socket re-verify) | Spike B |
+| W4 (Oct 10–11) | Supervisor (`x/sys/windows/svc` for the plumbing, started at logon rather than as a session-0 service): supervise distro + dockerd, restart on crash and on user `wsl --shutdown`; structured logging (Event Log + rotating file) | v0.1 |
+| W5 (Oct 17–18) | Auto-logon runner playbook (documented, not automated — see PLAN §06); sleep/resume + network-change recovery (power events → socket re-verify) | Spike B (#3) |
 | W6 (Oct 31–Nov 1) | Guest agent over AF_HYPERV vsock (replaces per-connection spawn; latency parity with Desktop); on-demand start + `idle-timeout` via `hawser config`; `wsl-integrate`; `migrate --from-desktop`; tray (6 items) | W4 |
 
 **Exit criteria:**
 - [ ] kill `wsl.exe` / `wsl --shutdown` / reboot / sleep-resume → next `docker ps` works, zero clicks
-- [ ] service-account install runs a container job with **no user logged in**
+- [ ] on a machine with auto-logon configured, a reboot brings the engine back and a container job runs with **nobody physically present**
 - [ ] pipe round-trip latency within 2× of Docker Desktop on `docker version` (vsock agent)
 - [ ] `migrate --from-desktop` round-trips images + volumes on a machine with real Desktop state
 - [ ] idle-timeout stops the VM; first `docker ps` after cold-starts it in ~2 s
 
-**Retires risks:** session-0 (the CI differentiator), idle-RAM complaint. **Note:** wslc GA likely lands during this window — have the v0.1 comparison post ready to ride it.
+**Retires risks:** idle-RAM complaint, unattended recovery. (Session-0 is no longer a risk to retire — it is a settled constraint, #3.) **Note:** wslc GA likely lands during this window — have the v0.1 comparison post ready to ride it, and note that wslc inherits the same session requirement.
 
 ---
 
@@ -127,7 +127,8 @@ Reliability guarantees, not features: self-hosted e2e runner with nested virtual
 | Trigger | Watch | Response |
 |---|---|---|
 | Spike A fails | week 1 | stop, rethink architecture |
-| Spike B fails all patterns | week 1 | demote CI headline; rewrite PLAN §06 before v0.1 publishes |
+| ~~Spike B fails all patterns~~ | **fired, week 1** | done: CI headline demoted, PLAN §03/§06/§09 rewritten before v0.1 published |
+| WSL gains service-context support | continuous | would restore true sessionless operation and remove the auto-logon requirement for every WSL-based engine at once — revisit PLAN §06 if it ships |
 | wslc GA announcement | fall 2026 (during v0.2) | publish comparison post same week; no roadmap change |
 | **microsoft/WSL#40976** gets a maintainer reply, milestone, or shipped endpoint | continuous | deliberate positioning review: Hawser's glue layer (doctor, service, policy, path-translating pipe) can sit atop wslc's endpoint |
 | virtiofs reaches standard WSL distros | continuous | adopt immediately — attacks slow-9P bind mounts for free |
