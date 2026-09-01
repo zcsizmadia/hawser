@@ -1,0 +1,501 @@
+package provision_test
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/zcsizmadia/hawser/internal/provision"
+	"github.com/zcsizmadia/hawser/internal/wsl"
+)
+
+// fakeWSL is a scriptable stand-in for wsl.exe.
+type fakeWSL struct {
+	mu sync.Mutex
+
+	status  wsl.Status
+	distros []wsl.Distro
+
+	imported     [][3]string // distro, dir, rootfs
+	started      [][]string
+	terminated   []string
+	unregistered []string
+
+	// socketAlwaysUp models an engine that is already running before we start.
+	socketAlwaysUp bool
+	// socketUpAfter delays the socket by N checks after dockerd is launched,
+	// simulating a daemon that takes a moment to come up.
+	socketUpAfter int
+	socketCalls   int
+
+	importErr error
+	statusErr error
+	listErr   error
+}
+
+func (f *fakeWSL) Status(context.Context) (wsl.Status, error) {
+	return f.status, f.statusErr
+}
+
+func (f *fakeWSL) Import(_ context.Context, distro, dir, rootfs string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.importErr != nil {
+		return f.importErr
+	}
+	f.imported = append(f.imported, [3]string{distro, dir, rootfs})
+	f.distros = append(f.distros, wsl.Distro{Name: distro, State: "Stopped", Version: 2})
+	return nil
+}
+
+func (f *fakeWSL) Unregister(_ context.Context, distro string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unregistered = append(f.unregistered, distro)
+	out := f.distros[:0]
+	for _, d := range f.distros {
+		if d.Name != distro {
+			out = append(out, d)
+		}
+	}
+	f.distros = out
+	return nil
+}
+
+func (f *fakeWSL) Terminate(_ context.Context, distro string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.terminated = append(f.terminated, distro)
+	return nil
+}
+
+func (f *fakeWSL) List(context.Context) ([]wsl.Distro, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := make([]wsl.Distro, len(f.distros))
+	copy(out, f.distros)
+	return out, nil
+}
+
+func (f *fakeWSL) Exec(_ context.Context, _, _ string, args ...string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(args) >= 2 && args[0] == "test" && args[1] == "-S" {
+		if f.socketAlwaysUp {
+			return "", nil
+		}
+		// No socket until something launched dockerd — the same order a real
+		// machine enforces, so tests cannot accidentally skip the start path.
+		if len(f.started) == 0 {
+			return "", errors.New("exit status 1")
+		}
+		f.socketCalls++
+		if f.socketCalls > f.socketUpAfter {
+			return "", nil
+		}
+		return "", errors.New("exit status 1")
+	}
+	if len(args) > 0 && args[0] == "tail" {
+		return "dockerd log line 1\ndockerd log line 2", nil
+	}
+	return "", nil
+}
+
+func (f *fakeWSL) Start(_ context.Context, _, _ string, args ...string) (func(), error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.started = append(f.started, args)
+	return func() {}, nil
+}
+
+var _ wsl.WSL = (*fakeWSL)(nil)
+
+func healthyWSL() *fakeWSL {
+	return &fakeWSL{status: wsl.Status{Installed: true, DefaultVersion: 2, Version: "2.7.8.0"}}
+}
+
+// rootfsServer serves a payload and returns its URL and SHA-256.
+func rootfsServer(t *testing.T, payload []byte) (url, sum string) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(payload)
+	}))
+	t.Cleanup(srv.Close)
+	h := sha256.Sum256(payload)
+	return srv.URL + "/hawser-rootfs-29.7.2.tar.gz", hex.EncodeToString(h[:])
+}
+
+func testOptions(t *testing.T, url, sum string) provision.Options {
+	t.Helper()
+	dir := t.TempDir()
+	return provision.Options{
+		StateDir:      filepath.Join(dir, "state"),
+		DataDir:       filepath.Join(dir, "data"),
+		RootfsURL:     url,
+		RootfsSHA256:  sum,
+		EngineVersion: "29.7.2",
+		StartTimeout:  2 * time.Second,
+	}
+}
+
+func TestInstallHappyPath(t *testing.T) {
+	url, sum := rootfsServer(t, []byte("pretend rootfs tarball"))
+	w := healthyWSL()
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+	opts := testOptions(t, url, sum)
+
+	m, err := p.Install(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	if len(w.imported) != 1 {
+		t.Fatalf("imported %d distros, want 1", len(w.imported))
+	}
+	if got := w.imported[0][0]; got != provision.DefaultDistro {
+		t.Errorf("distro = %q, want %q", got, provision.DefaultDistro)
+	}
+	if got := w.imported[0][1]; got != opts.DataDir {
+		t.Errorf("data dir = %q, want %q", got, opts.DataDir)
+	}
+	// The rootfs must have been downloaded to disk before import.
+	if _, err := os.Stat(w.imported[0][2]); err != nil {
+		t.Errorf("rootfs not on disk at import time: %v", err)
+	}
+	if len(w.started) != 1 {
+		t.Errorf("started %d commands, want 1 (dockerd)", len(w.started))
+	}
+
+	if m.EngineVersion != "29.7.2" || m.WSLVersion != "2.7.8.0" {
+		t.Errorf("manifest = %+v", m)
+	}
+
+	// And it must be readable back, which is what `hawser version` relies on.
+	back, err := p.ReadManifest(opts)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	if back.Distro != m.Distro || back.RootfsSHA256 != sum {
+		t.Errorf("manifest round-trip mismatch: %+v vs %+v", back, m)
+	}
+}
+
+func TestInstallRefusesBadChecksum(t *testing.T) {
+	// The rootfs becomes root inside the engine VM, so this must be a hard stop
+	// and must not leave a partial file that a later run could trust.
+	url, _ := rootfsServer(t, []byte("pretend rootfs tarball"))
+	wrong := strings.Repeat("0", 64)
+
+	w := healthyWSL()
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+	opts := testOptions(t, url, wrong)
+
+	_, err := p.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install succeeded with a bad checksum")
+	}
+	var mismatch *provision.ErrChecksumMismatch
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("error = %T (%v), want *ErrChecksumMismatch", err, err)
+	}
+	if len(w.imported) != 0 {
+		t.Error("distro was imported despite the checksum mismatch")
+	}
+
+	// Nothing left behind at all: a partial file could be mistaken for a good
+	// download, and a completed one would be actively dangerous.
+	entries, _ := os.ReadDir(filepath.Join(opts.StateDir, "rootfs"))
+	for _, e := range entries {
+		t.Errorf("file left behind after checksum failure: %q", e.Name())
+	}
+}
+
+func TestInstallRequiresChecksum(t *testing.T) {
+	url, _ := rootfsServer(t, []byte("x"))
+	p := &provision.Provisioner{WSL: healthyWSL(), Logger: quietLogger()}
+	opts := testOptions(t, url, "")
+
+	if _, err := p.Install(context.Background(), opts); err == nil {
+		t.Fatal("Install succeeded with no expected checksum")
+	}
+}
+
+func TestInstallRequiresRootfsURL(t *testing.T) {
+	p := &provision.Provisioner{WSL: healthyWSL(), Logger: quietLogger()}
+	opts := testOptions(t, "", "")
+	if _, err := p.Install(context.Background(), opts); err == nil {
+		t.Fatal("Install succeeded with no rootfs URL")
+	}
+}
+
+func TestInstallRefusesExistingDistro(t *testing.T) {
+	// That distro holds the user's images and volumes; reimporting would
+	// destroy them, so this is a refusal rather than a silent overwrite.
+	url, sum := rootfsServer(t, []byte("rootfs"))
+	w := healthyWSL()
+	w.distros = []wsl.Distro{{Name: provision.DefaultDistro, State: "Stopped", Version: 2}}
+
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+	_, err := p.Install(context.Background(), testOptions(t, url, sum))
+	if err == nil {
+		t.Fatal("Install succeeded over an existing distro")
+	}
+	var pfe *provision.PreflightError
+	if !errors.As(err, &pfe) {
+		t.Fatalf("error = %T (%v), want *PreflightError", err, err)
+	}
+	if !strings.Contains(err.Error(), "uninstall") {
+		t.Errorf("error should suggest uninstall, got: %v", err)
+	}
+	if len(w.imported) != 0 {
+		t.Error("import happened despite preflight failure")
+	}
+}
+
+func TestInstallReusesVerifiedCachedRootfs(t *testing.T) {
+	payload := []byte("cached rootfs")
+	var hits int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		w.Write(payload)
+	}))
+	defer srv.Close()
+	h := sha256.Sum256(payload)
+	sum := hex.EncodeToString(h[:])
+	url := srv.URL + "/rootfs.tar.gz"
+
+	opts := testOptions(t, url, sum)
+	p := &provision.Provisioner{WSL: healthyWSL(), Logger: quietLogger()}
+	if _, err := p.Install(context.Background(), opts); err != nil {
+		t.Fatalf("first install: %v", err)
+	}
+
+	// Second attempt with a fresh WSL (no distro registered) must not re-download.
+	p2 := &provision.Provisioner{WSL: healthyWSL(), Logger: quietLogger()}
+	if _, err := p2.Install(context.Background(), opts); err != nil {
+		t.Fatalf("second install: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if hits != 1 {
+		t.Errorf("server hit %d times, want 1 (cached copy should be reused)", hits)
+	}
+}
+
+func TestInstallReplacesCorruptCachedRootfs(t *testing.T) {
+	payload := []byte("good rootfs")
+	url, sum := rootfsServer(t, payload)
+	opts := testOptions(t, url, sum)
+
+	// Plant a file with the right name but the wrong contents.
+	cache := filepath.Join(opts.StateDir, "rootfs", filepath.Base(url))
+	if err := os.MkdirAll(filepath.Dir(cache), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cache, []byte("corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &provision.Provisioner{WSL: healthyWSL(), Logger: quietLogger()}
+	if _, err := p.Install(context.Background(), opts); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	got, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Errorf("cached rootfs = %q, want it replaced with %q", got, payload)
+	}
+}
+
+func TestInstallWritesManifestBeforeEngineStart(t *testing.T) {
+	// If the engine fails to start, uninstall still needs to know what to
+	// clean up, so the manifest must already be on disk.
+	url, sum := rootfsServer(t, []byte("rootfs"))
+	w := healthyWSL()
+	w.socketUpAfter = 1000 // never comes up within the timeout
+
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+	opts := testOptions(t, url, sum)
+	opts.StartTimeout = 500 * time.Millisecond
+
+	m, err := p.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install succeeded despite the engine never starting")
+	}
+	if m == nil {
+		t.Fatal("Install returned no manifest; uninstall would not know what to remove")
+	}
+	if _, err := p.ReadManifest(opts); err != nil {
+		t.Errorf("manifest not persisted: %v", err)
+	}
+	// The failure must name the daemon log, or it is undiagnosable.
+	if !strings.Contains(err.Error(), "dockerd log line") {
+		t.Errorf("error should include the dockerd log, got: %v", err)
+	}
+}
+
+func TestStartEngineWaitsForSocket(t *testing.T) {
+	w := healthyWSL()
+	w.socketUpAfter = 3 // succeeds on the 4th check
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+
+	opts := provision.Options{StateDir: t.TempDir(), StartTimeout: 5 * time.Second}
+	if err := p.StartEngine(context.Background(), opts); err != nil {
+		t.Fatalf("StartEngine: %v", err)
+	}
+	if len(w.started) != 1 {
+		t.Errorf("started %d commands, want 1", len(w.started))
+	}
+}
+
+func TestStartEngineSkipsWhenAlreadyRunning(t *testing.T) {
+	w := healthyWSL()
+	w.socketAlwaysUp = true
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+
+	opts := provision.Options{StateDir: t.TempDir(), StartTimeout: time.Second}
+	if err := p.StartEngine(context.Background(), opts); err != nil {
+		t.Fatalf("StartEngine: %v", err)
+	}
+	if len(w.started) != 0 {
+		t.Errorf("dockerd was launched even though the socket was already up")
+	}
+}
+
+func TestStartEngineRespectsContextCancel(t *testing.T) {
+	w := healthyWSL()
+	w.socketUpAfter = 1000
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	opts := provision.Options{StateDir: t.TempDir(), StartTimeout: 30 * time.Second}
+	start := time.Now()
+	if err := p.StartEngine(ctx, opts); err == nil {
+		t.Fatal("StartEngine succeeded, want cancellation")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("took %s to honor cancellation", elapsed)
+	}
+}
+
+func TestUninstallRemovesWhatInstallCreated(t *testing.T) {
+	url, sum := rootfsServer(t, []byte("rootfs"))
+	w := healthyWSL()
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+	opts := testOptions(t, url, sum)
+
+	if _, err := p.Install(context.Background(), opts); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if err := p.Uninstall(context.Background(), opts); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+
+	if len(w.unregistered) != 1 || w.unregistered[0] != provision.DefaultDistro {
+		t.Errorf("unregistered = %v, want [%s]", w.unregistered, provision.DefaultDistro)
+	}
+	if _, err := os.Stat(opts.DataDir); !os.IsNotExist(err) {
+		t.Errorf("data dir still present: %v", err)
+	}
+	if _, err := p.ReadManifest(opts); err == nil {
+		t.Error("manifest still present after uninstall")
+	}
+}
+
+func TestUninstallOnCleanMachineIsNotAnError(t *testing.T) {
+	// A half-finished or already-removed install must still come clean.
+	p := &provision.Provisioner{WSL: healthyWSL(), Logger: quietLogger()}
+	opts := testOptions(t, "", "")
+	if err := p.Uninstall(context.Background(), opts); err != nil {
+		t.Errorf("Uninstall on a clean machine returned %v, want nil", err)
+	}
+}
+
+func TestUninstallPrefersManifestOverOptions(t *testing.T) {
+	// The manifest records where the install actually went, which matters when
+	// the user installed with --distro or --data-dir and later runs a bare
+	// `hawser uninstall`.
+	url, sum := rootfsServer(t, []byte("rootfs"))
+	w := healthyWSL()
+	p := &provision.Provisioner{WSL: w, Logger: quietLogger()}
+
+	opts := testOptions(t, url, sum)
+	opts.Distro = "hawser-custom"
+	if _, err := p.Install(context.Background(), opts); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	// Uninstall called without the custom name, as the CLI would by default.
+	bare := provision.Options{StateDir: opts.StateDir}
+	if err := p.Uninstall(context.Background(), bare); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	if len(w.unregistered) != 1 || w.unregistered[0] != "hawser-custom" {
+		t.Errorf("unregistered = %v, want [hawser-custom]", w.unregistered)
+	}
+}
+
+func TestFetchRootfsSurfacesHTTPErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "gone", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	p := &provision.Provisioner{WSL: healthyWSL(), Logger: quietLogger()}
+	opts := testOptions(t, srv.URL+"/missing.tar.gz", strings.Repeat("a", 64))
+
+	_, err := p.Install(context.Background(), opts)
+	if err == nil {
+		t.Fatal("Install succeeded against a 404")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("error should mention the HTTP status, got: %v", err)
+	}
+}
+
+// customFetcher lets a test supply rootfs bytes without a server.
+type customFetcher struct{ payload []byte }
+
+func (c customFetcher) Fetch(context.Context, string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader(string(c.payload))), nil
+}
+
+func TestFetcherSeam(t *testing.T) {
+	payload := []byte("rootfs via custom fetcher")
+	h := sha256.Sum256(payload)
+	p := &provision.Provisioner{
+		WSL:     healthyWSL(),
+		Fetcher: customFetcher{payload: payload},
+		Logger:  quietLogger(),
+	}
+	opts := testOptions(t, "https://example.invalid/rootfs.tar.gz", hex.EncodeToString(h[:]))
+
+	if _, err := p.Install(context.Background(), opts); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+}
