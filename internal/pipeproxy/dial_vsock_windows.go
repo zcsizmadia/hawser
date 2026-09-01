@@ -4,6 +4,7 @@ package pipeproxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -27,12 +28,27 @@ type VsockDialer struct {
 	// local, so anything slower than that is a "not there", not a "be patient".
 	DialTimeout time.Duration
 
-	// mu guards vmid, the discovered-and-verified utility VM. Caching it
-	// skips registry enumeration on every connection; a dial failure clears
-	// it, so a restarted VM (new GUID) is re-discovered on the next attempt.
-	mu   sync.Mutex
-	vmid *guid.GUID
+	// Cooldown is how long Dial fails instantly after a failed attempt,
+	// instead of probing again. Zero uses 15s; negative disables the cache.
+	// Without it, an agent-less rootfs would pay a full dial timeout on
+	// every connection while the fallback transport does the real work.
+	Cooldown time.Duration
+
+	// dialHV overrides the transport dial in tests.
+	dialHV func(ctx context.Context, vmid guid.GUID) (io.ReadWriteCloser, error)
+
+	// mu guards the discovery/failure cache. vmid is the verified utility VM,
+	// so registry enumeration is skipped per connection; a dial failure clears
+	// it (a restarted VM gets a new GUID) and stamps lastFailure.
+	mu          sync.Mutex
+	vmid        *guid.GUID
+	lastFailure time.Time
 }
+
+// ErrCoolingDown is returned while the dialer sits out its post-failure
+// cooldown. Callers with a fallback treat it like any dial error, just an
+// instant one.
+var ErrCoolingDown = errors.New("pipeproxy: vsock transport cooling down after a failure")
 
 // computeSystemKey is the Host Compute Service's mirror of running compute
 // systems. Readable by standard users — the property Spike C established that
@@ -74,38 +90,107 @@ func (d *VsockDialer) timeout() time.Duration {
 	return d.DialTimeout
 }
 
+// rawDial is the transport dial, a seam for tests. The production dial wraps
+// winio in a goroutine because winio's ConnectEx wait does not check the
+// context ("asyncIO doesn't check the context" — winio's own comment), and an
+// hv-socket connect to a port nobody listens on is not refused, it times out
+// at OS level after ~16s. Measured: an agent-less rootfs turned every docker
+// command into a 32s crawl. The goroutine is abandoned on timeout and closes
+// the connection if the OS ever completes it.
+func (d *VsockDialer) rawDial(ctx context.Context, vmid guid.GUID) (io.ReadWriteCloser, error) {
+	if d.dialHV != nil {
+		return d.dialHV(ctx, vmid)
+	}
+	type result struct {
+		conn *winio.HvsockConn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		conn, err := winio.Dial(ctx, &winio.HvsockAddr{
+			VMID:      vmid,
+			ServiceID: winio.VsockServiceID(d.port()),
+		})
+		ch <- result{conn, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.conn, r.err
+	case <-time.After(d.timeout()):
+		go func() {
+			if r := <-ch; r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return nil, fmt.Errorf("pipeproxy: vsock dial timed out after %s", d.timeout())
+	case <-ctx.Done():
+		go func() {
+			if r := <-ch; r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
 // dialVM makes one verified connection: transport dial plus the vsockproto
 // handshake. The handshake is what turns "some listener answered on our port
 // in some VM" into "this is a hawser agent" — non-WSL utility VMs can appear
 // in the compute-system list, and the port space inside the WSL VM is shared
 // with every other distro.
 func (d *VsockDialer) dialVM(ctx context.Context, vmid guid.GUID) (io.ReadWriteCloser, error) {
-	ctx, cancel := context.WithTimeout(ctx, d.timeout())
-	defer cancel()
-	conn, err := winio.Dial(ctx, &winio.HvsockAddr{
-		VMID:      vmid,
-		ServiceID: winio.VsockServiceID(d.port()),
-	})
+	conn, err := d.rawDial(ctx, vmid)
 	if err != nil {
 		return nil, err
 	}
-	// The handshake shares the dial's deadline; clear it before handing the
-	// transparent stream to the relay.
-	conn.SetDeadline(time.Now().Add(d.timeout()))
+	// The handshake gets its own deadline when the transport supports one;
+	// cleared before the transparent stream goes to the relay.
+	type deadliner interface{ SetDeadline(time.Time) error }
+	if dc, ok := conn.(deadliner); ok {
+		dc.SetDeadline(time.Now().Add(d.timeout()))
+		defer dc.SetDeadline(time.Time{})
+	}
 	if _, err := vsockproto.ClientHandshake(conn); err != nil {
 		conn.Close()
 		return nil, err
 	}
-	conn.SetDeadline(time.Time{})
 	return conn, nil
+}
+
+func (d *VsockDialer) cooldown() time.Duration {
+	switch {
+	case d.Cooldown < 0:
+		return 0
+	case d.Cooldown == 0:
+		return 15 * time.Second
+	default:
+		return d.Cooldown
+	}
 }
 
 // Dial implements Dialer.
 func (d *VsockDialer) Dial(ctx context.Context) (io.ReadWriteCloser, error) {
 	d.mu.Lock()
 	cached := d.vmid
+	coolingDown := !d.lastFailure.IsZero() && time.Since(d.lastFailure) < d.cooldown()
 	d.mu.Unlock()
 
+	if coolingDown {
+		return nil, ErrCoolingDown
+	}
+
+	conn, err := d.dialAny(ctx, cached)
+	d.mu.Lock()
+	if err != nil {
+		d.lastFailure = time.Now()
+	} else {
+		d.lastFailure = time.Time{}
+	}
+	d.mu.Unlock()
+	return conn, err
+}
+
+func (d *VsockDialer) dialAny(ctx context.Context, cached *guid.GUID) (io.ReadWriteCloser, error) {
 	if cached != nil {
 		if conn, err := d.dialVM(ctx, *cached); err == nil {
 			return conn, nil

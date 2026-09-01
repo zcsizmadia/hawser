@@ -160,11 +160,15 @@ func (s *Server) handle(ctx context.Context, client net.Conn) {
 		// it needs a thin adapter to fit the Handler signature.
 		handler = func(c net.Conn, e io.ReadWriteCloser) error { return Relay(c, e) }
 	}
-	if err := handler(client, engine); err != nil {
-		// Warn, not Debug: filterClosed has already dropped the ordinary ways a
-		// docker client hangs up, so anything left is a real fault the user
-		// wants to see. An engine that is down otherwise looks like the bridge
-		// doing nothing at all.
+	// filterClosed here as well as inside Relay: a handler like RewriteBinds
+	// returns transport errors from its own HTTP forwarding (wrapped with %w,
+	// so errors.Is still sees them), and a docker CLI exiting mid-response is
+	// ordinary shutdown regardless of which layer noticed it first.
+	if err := filterClosed(handler(client, engine)); err != nil {
+		// Warn, not Debug: the ordinary ways a docker client hangs up are
+		// filtered, so anything left is a real fault the user wants to see. An
+		// engine that is down otherwise looks like the bridge doing nothing at
+		// all.
 		log.Warn("connection failed", "error", err)
 	}
 }
