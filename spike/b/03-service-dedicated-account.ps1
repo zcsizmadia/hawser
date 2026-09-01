@@ -17,8 +17,42 @@ if (-not (Test-Path $exe)) { throw "run 01-preflight.ps1 first (probe.exe missin
 
 # Generated locally, used only for these API calls, never printed or written to
 # disk. A real installer would use a virtual service account or a managed one.
-Add-Type -AssemblyName System.Web
-$pw = [System.Web.Security.Membership]::GeneratePassword(24, 6)
+function New-RandomPassword {
+    param([int]$Length = 24)
+    # Not System.Web.Security.Membership: that is .NET Framework only, so it is
+    # absent under PowerShell 7 (.NET Core). RandomNumberGenerator::Create()
+    # exists on both, so this works in 5.1 and 7 alike.
+    #
+    # Symbols are restricted to ones that survive sc.exe and schtasks argument
+    # parsing unscathed - no quotes, ampersands, carets or percent signs.
+    $sets = @(
+        'ABCDEFGHIJKLMNPQRSTUVWXYZ',
+        'abcdefghijkmnopqrstuvwxyz',
+        '23456789',
+        '!#$*+-=?@_'
+    )
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $bytes = [byte[]]::new(4)
+        $pick = {
+            param($chars)
+            $rng.GetBytes($bytes)
+            $n = [BitConverter]::ToUInt32($bytes, 0)
+            $chars[[int]($n % [uint32]$chars.Length)]
+        }
+        # One character from each set first, so Windows password-complexity
+        # policy is satisfied regardless of what the rest happens to draw.
+        $chars = foreach ($s in $sets) { & $pick $s }
+        $all = -join $sets
+        $chars += 1..($Length - $sets.Count) | ForEach-Object { & $pick $all }
+        # Shuffle, so the guaranteed characters are not always in front.
+        -join ($chars | Sort-Object { & $pick '0123456789' })
+    } finally {
+        $rng.Dispose()
+    }
+}
+
+$pw = New-RandomPassword -Length 24
 $sec = ConvertTo-SecureString $pw -AsPlainText -Force
 
 if (-not (Get-LocalUser $user -ErrorAction SilentlyContinue)) {
