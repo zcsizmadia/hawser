@@ -8,8 +8,11 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 
+	"github.com/zcsizmadia/hawser/internal/autostart"
 	"github.com/zcsizmadia/hawser/internal/dockerctx"
+	"github.com/zcsizmadia/hawser/internal/logging"
 	"github.com/zcsizmadia/hawser/internal/pipeproxy"
 	"github.com/zcsizmadia/hawser/internal/provision"
 	"github.com/zcsizmadia/hawser/internal/release"
@@ -39,6 +42,7 @@ func runInstall(args []string) int {
 		dataDir       = fs.String("data-dir", "", "where the distro's VHDX lives (default: under the state dir)")
 		stateDir      = fs.String("state-dir", "", "override Hawser's state directory")
 		headless      = fs.Bool("headless", false, "never prompt; for unattended and CI installs")
+		noAutostart   = fs.Bool("no-autostart", false, "do not register the supervisor to start at logon")
 		rootfsURL     = fs.String("rootfs-url", "", "override the rootfs URL (development)")
 		rootfsSHA     = fs.String("rootfs-sha256", "", "expected rootfs SHA-256; required with --rootfs-url")
 		asJSON        = fs.Bool("json", false, "emit the resulting manifest as JSON")
@@ -133,6 +137,28 @@ flags:
 	pipe, pipeReason := pipeproxy.SelectPipeName("")
 	dockerHost := pipeproxy.DockerHostFor(pipe)
 
+	// Autostart is registered by default: "install once, docker ps works
+	// forever" is the headline promise, and a supervisor that only runs when
+	// launched by hand does not deliver it. Refusal is honest, not fatal —
+	// missing hawserw.exe (a bare go-build binary rather than a release zip)
+	// downgrades to a warning with the manual alternative named.
+	if !*noAutostart {
+		if exe, err := os.Executable(); err == nil {
+			if err := autostart.Enable(exe); err != nil {
+				log.Warn("autostart not registered", "reason", err,
+					"fix", "run `hawser start` after each logon, or `hawser autostart enable` from a release install")
+			} else {
+				log.Info("supervisor will start at logon", "disable", "hawser autostart disable")
+			}
+		}
+	}
+
+	// Registering the Event Log source needs elevation; cosmetic when absent
+	// (entries render with a boilerplate prefix), so best-effort by design.
+	if err := logging.RegisterEventSource(); err != nil {
+		log.Debug("event log source not registered (needs elevation; cosmetic)", "error", err)
+	}
+
 	contextReady := false
 	mgr := &dockerctx.Manager{}
 	if err := mgr.Ensure(ctx, dockerHost); err != nil {
@@ -157,13 +183,13 @@ Engine installed and running.
 
 `, manifest.Distro, manifest.EngineVersion, manifest.DataDir, pipe, pipeReason)
 
-	fmt.Printf(`Start the bridge, then use docker normally:
+	fmt.Printf(`Start the always-on bridge:
 
-  hawser proxy
+  hawser start
 
 `)
 	if contextReady {
-		fmt.Printf(`In another shell:
+		fmt.Printf(`Then use docker normally:
 
   docker --context %s run --rm hello-world
 
@@ -179,6 +205,10 @@ Or make it the default for every shell:
   docker run --rm hello-world
 
 `, dockerHost)
+	}
+	if !*noAutostart {
+		fmt.Println("From your next logon the supervisor starts automatically;")
+		fmt.Println("`hawser autostart disable` turns that off.")
 	}
 	return exitOK
 }
@@ -235,6 +265,22 @@ flags:
 
 	ctx, stop := interruptible()
 	defer stop()
+
+	// Autostart goes first: a Run entry pointing at a binary that is about to
+	// stop having anything to supervise would relaunch a supervisor into an
+	// empty install at next logon. Ownership-checked, so uninstalling a
+	// secondary install (the e2e suite beside a real one) cannot delete the
+	// primary install's entry.
+	if exe, err := os.Executable(); err == nil {
+		if removed, err := autostart.DisableIfOwned(filepath.Dir(exe)); err != nil {
+			log.Warn("could not remove the autostart entry", "error", err)
+		} else if removed {
+			log.Info("autostart entry removed")
+		}
+	}
+	if err := logging.UnregisterEventSource(); err != nil {
+		log.Debug("event log source not unregistered (needs elevation; cosmetic)", "error", err)
+	}
 
 	// Remove the context before the distro: leaving a context pointed at a
 	// pipe nobody serves would make every later docker command fail, which is
