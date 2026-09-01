@@ -28,6 +28,7 @@ type command struct {
 func commands() []command {
 	return []command{
 		{"autostart", "start the supervisor at logon: enable, disable, status", runAutostart},
+		{"config", "list, get, or set Hawser settings (idle-timeout)", runConfig},
 		{"install", "provision the engine distro and start it", runInstall},
 		{"proxy", "serve the docker pipe in the foreground (debug mode)", runProxy},
 		{"restart", "stop the engine, then start it", runRestart},

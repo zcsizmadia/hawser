@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/zcsizmadia/hawser/internal/config"
 	"github.com/zcsizmadia/hawser/internal/dockerctx"
 	"github.com/zcsizmadia/hawser/internal/logging"
 	"github.com/zcsizmadia/hawser/internal/pipeproxy"
@@ -62,7 +63,7 @@ crash restart with backoff, recovery from `+"`wsl --shutdown`"+` and sleep/resum
 honoring `+"`hawser stop`"+` until `+"`hawser start`"+`. One instance per install.
 
 Runs in the foreground; `+"`hawser start`"+` spawns it in the background, and the
-logon autostart (upcoming) runs it for you. Logs go to supervisor.log in the
+logon autostart (`+"`hawser autostart`"+`) runs it for you. Logs go to supervisor.log in the
 state directory (rotated) as well as stderr.
 
 flags:
@@ -126,20 +127,35 @@ flags:
 	ctx, stop := interruptible()
 	defer stop()
 
-	// The reconciler keeps the engine matching the desired state...
-	sup := &supervise.Supervisor{
-		Engine: engineAdapter{p: p, opts: opts},
-		Config: supervise.Config{StateDir: opts.StateDir},
-		Log:    log,
-	}
-	go sup.Run(ctx)
-
-	// ...while the pipe server carries traffic. Both stop together.
+	// Server and supervisor are deliberately entangled (#41): the server's
+	// traffic feeds the supervisor's idle detection, and the supervisor's
+	// Demand wakes an idle-stopped engine for the server's next connection.
+	dialer := engineDialer(targetDistro, "", log)
 	srv := &pipeproxy.Server{
-		Dialer:  engineDialer(targetDistro, "", log),
 		Logger:  log,
 		Handler: pipeproxy.RewriteBinds,
 	}
+	sup := &supervise.Supervisor{
+		Engine:   engineAdapter{p: p, opts: opts},
+		Config:   supervise.Config{StateDir: opts.StateDir},
+		Log:      log,
+		Activity: srv,
+		// Read per tick, so `hawser config set idle-timeout` applies live. A
+		// corrupt config file reads as "off": never idle-stop on a guess.
+		IdleTimeout: func() time.Duration {
+			c, err := config.Load(opts.StateDir)
+			if err != nil {
+				log.Warn("config unreadable; idle stops disabled", "error", err)
+				return 0
+			}
+			return c.IdleTimeout
+		},
+		Busy: busyProbe(dialer),
+	}
+	srv.Dialer = &demandDialer{sup: sup, inner: dialer}
+	go sup.Run(ctx)
+
+	// The pipe server carries traffic; both stop together.
 	if err := srv.Serve(ctx, listener); err != nil {
 		fmt.Fprintf(os.Stderr, "hawser: %v\n", err)
 		return exitError
@@ -177,6 +193,13 @@ running, and waits for the engine to answer.
 
 	opts := optsWithResolvedStateDir(provision.Options{StateDir: *stateDir})
 	if err := supervise.WriteDesired(opts.StateDir, supervise.DesiredRunning); err != nil {
+		fmt.Fprintf(os.Stderr, "hawser: %v\n", err)
+		return exitError
+	}
+	// Removing the idle marker is the wake-up poke: an idle-stopped engine is
+	// down on purpose, and the supervisor will not restart it while the marker
+	// stands — but `hawser start` is the user saying now.
+	if err := supervise.WriteEngineState(opts.StateDir, supervise.EngineActive); err != nil {
 		fmt.Fprintf(os.Stderr, "hawser: %v\n", err)
 		return exitError
 	}
@@ -235,6 +258,9 @@ stopped. Only Hawser's own distro is touched, never other WSL distros.
 		fmt.Fprintf(os.Stderr, "hawser: %v\n", err)
 		return exitError
 	}
+	// An explicit stop supersedes an idle stop; the marker would make status
+	// claim "idle (wakes on demand)" about an engine that must stay down.
+	supervise.WriteEngineState(opts.StateDir, supervise.EngineActive)
 
 	p := &provision.Provisioner{Logger: cliLogger(false)}
 	distro, ok := resolveDistro(p, opts)
@@ -301,8 +327,13 @@ func runStatus(args []string) int {
 		if supervise.Held(opts.StateDir) {
 			st.Supervisor = "running"
 		}
-		if p.EngineRunning(context.Background(), opts) {
+		switch {
+		case p.EngineRunning(context.Background(), opts):
 			st.Engine = "running"
+		case supervise.ReadEngineState(opts.StateDir) == supervise.EngineIdle:
+			// Down by design (#41): the idle timeout elapsed, and the next
+			// docker command wakes it. Scripts get to tell this from broken.
+			st.Engine = "idle"
 		}
 	}
 
@@ -316,7 +347,8 @@ func runStatus(args []string) int {
 	fmt.Printf("distro      %s\nsupervisor  %s\nengine      %s\ndesired     %s\n",
 		st.Distro, st.Supervisor, st.Engine, st.Desired)
 	// Exit code mirrors engine health, so scripts can gate on it directly.
-	if st.Engine != "running" {
+	// Idle counts as healthy: the engine is a docker command away, on purpose.
+	if st.Engine != "running" && st.Engine != "idle" {
 		return exitError
 	}
 	return exitOK

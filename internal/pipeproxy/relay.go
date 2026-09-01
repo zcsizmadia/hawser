@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // Dialer opens one connection to the engine socket. Production dials through
@@ -63,7 +65,27 @@ type Server struct {
 
 	mu     sync.Mutex
 	active map[io.Closer]struct{}
+
+	// clients and lastActivity feed idle detection (supervise.Activity):
+	// how many client connections are open, and when one last opened or
+	// closed (unix nanos; 0 = never).
+	clients      atomic.Int64
+	lastActivity atomic.Int64
 }
+
+// ActiveConns is how many client connections are open right now.
+func (s *Server) ActiveConns() int { return int(s.clients.Load()) }
+
+// LastActivity is when a connection last opened or closed; zero time if none.
+func (s *Server) LastActivity() time.Time {
+	ns := s.lastActivity.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+func (s *Server) touch() { s.lastActivity.Store(time.Now().UnixNano()) }
 
 // track registers a connection so shutdown can close it. Without this, a
 // client holding a streaming connection open (docker logs -f, docker events)
@@ -138,6 +160,13 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 func (s *Server) handle(ctx context.Context, client net.Conn) {
 	log := s.logger()
 	defer client.Close()
+
+	s.clients.Add(1)
+	s.touch()
+	defer func() {
+		s.clients.Add(-1)
+		s.touch()
+	}()
 
 	s.track(client)
 	defer s.untrack(client)
