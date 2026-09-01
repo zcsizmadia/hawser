@@ -29,6 +29,27 @@ Outputs, all three of which become release assets:
 The tarball is built deterministically (sorted entries, fixed mtimes and ownership,
 timestamp-free gzip), so the same pins reproduce the same checksum.
 
+## CI caching
+
+Compiling the engine is the expensive step; assembling the rootfs takes seconds.
+So CI caches only `engine-bin/` (the binaries plus `commits.txt`), keyed on a hash
+of `versions.env` + `build-engine.sh` — the two files that actually determine what
+those binaries are. Editing `daemon.json` or `wsl.conf` therefore rebuilds the
+tarball in seconds from cached binaries, while bumping a pin recompiles.
+
+The same mechanism works locally: point `BIN_DIR` at a directory you keep around.
+
+```bash
+BIN_DIR=~/.cache/hawser-engine ./guest/rootfs/build.sh out   # compiles once, reuses after
+```
+
+Two deliberate safety choices: there are **no `restore-keys`** (a partial cache match
+would hand us binaries built from different pins — worse than a miss), and the build
+re-verifies that a reused `dockerd` reports the pinned version before trusting it.
+A GitHub cache is writable by any branch, so that check is what stands between a
+poisoned entry and a shipped artifact. `CACHE_EPOCH` in `versions.env` forces a
+recompile when something outside the keyed files changes.
+
 ## Versions
 
 Every pin lives in `versions.env` — nothing is ever fetched as "latest". The component

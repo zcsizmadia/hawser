@@ -51,7 +51,20 @@ try {
 
     # --- go ---------------------------------------------------------------
     if (-not $SkipGo) {
-        if (Get-Command go -ErrorAction SilentlyContinue) {
+        $go = Get-Command go -ErrorAction SilentlyContinue
+        if (-not $go) {
+            # A freshly installed Go is usually missing from an already-open shell.
+            $cands = @("$env:ProgramFiles\Go\bin\go.exe",
+                       "$env:LOCALAPPDATA\Programs\Go\bin\go.exe")
+            foreach ($c in $cands) {
+                if (Test-Path $c) {
+                    $env:PATH = "$(Split-Path $c);$env:PATH"
+                    $go = Get-Command $c
+                    break
+                }
+            }
+        }
+        if ($go) {
             Write-Host "== gofmt / vet / test" -ForegroundColor Cyan
             $bad = gofmt -l .
             if ($bad) { Write-Host "gofmt needed:"; $bad; $failed += 'gofmt' }
