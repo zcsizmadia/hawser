@@ -74,7 +74,7 @@ install -m 0755 "$engine/bin/"* "$root/usr/local/bin/"
 cat > "$root/etc/docker/daemon.json" <<'JSON'
 {
   "log-driver": "json-file",
-  "log-opts": { "max-size": "10m", "max-files": "3" }
+  "log-opts": { "max-size": "10m", "max-file": "3" }
 }
 JSON
 

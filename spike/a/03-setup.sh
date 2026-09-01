@@ -11,7 +11,7 @@ mkdir -p /etc/docker /var/log
 cat > /etc/docker/daemon.json <<'EOF'
 {
   "log-driver": "json-file",
-  "log-opts": { "max-size": "10m", "max-files": "3" }
+  "log-opts": { "max-size": "10m", "max-file": "3" }
 }
 EOF
 
