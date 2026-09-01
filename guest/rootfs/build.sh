@@ -60,13 +60,34 @@ if [ ! -x "$engine/bin/dockerd" ]; then
       "golang:${GO_VERSION}-alpine" sh /build-engine.sh
 fi
 
+echo "==> building hawser-agent from this repo"
+# The vsock agent (#40) is the one binary in the rootfs that comes from this
+# repository rather than an upstream tag, so it is versioned by the rootfs
+# release itself. Built in the same pinned toolchain image as the engine, but
+# outside the BIN_DIR cache: it changes with this repo, not with versions.env.
+repo_root="$(cd "$here/../.." && pwd)"
+agent_out="$work/agent"
+mkdir -p "$agent_out"
+docker run --rm \
+  -v "$repo_root:/src:ro" \
+  -v "$agent_out:/out" \
+  -w /src \
+  -e CGO_ENABLED=0 \
+  "golang:${GO_VERSION}-alpine" \
+  sh -c "go build -trimpath -ldflags '-s -w' -o /out/hawser-agent ./guest/agent \
+         && chown $(id -u):$(id -g) /out/hawser-agent"
+
 echo "==> assembling rootfs"
 # Everything the image needs, staged as a build context.
 ctx="$work/ctx"
 mkdir -p "$ctx/bin"
 cp "$engine/bin/"* "$ctx/bin/"
+cp "$agent_out/hawser-agent" "$ctx/bin/"
 cp "$engine/commits.txt" "$ctx/commits"
 printf '%s\n' "$ENGINE_VERSION" > "$ctx/engine-version"
+# The agent states its own identity (static linux binary, runnable right
+# here); asking it beats duplicating the constant in shell.
+"$agent_out/hawser-agent" -version > "$ctx/agent-version"
 
 cat > "$ctx/daemon.json" <<'JSON'
 {

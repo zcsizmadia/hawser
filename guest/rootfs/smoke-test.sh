@@ -31,8 +31,9 @@ echo "==> expected files"
 # userland-proxy is enabled, and `dockerd --validate` does not catch that - the
 # first rootfs release imported fine and then failed at startup.
 for f in usr/local/bin/dockerd usr/local/bin/docker-proxy usr/local/bin/containerd \
-         usr/local/bin/runc usr/local/bin/buildkitd etc/docker/daemon.json etc/wsl.conf \
-         etc/hawser/engine-version etc/hawser/commits; do
+         usr/local/bin/runc usr/local/bin/buildkitd usr/local/bin/hawser-agent \
+         etc/docker/daemon.json etc/wsl.conf \
+         etc/hawser/engine-version etc/hawser/agent-version etc/hawser/commits; do
     test -e "$work/$f" || { echo "missing $f"; exit 1; }
     echo "  ok $f"
 done
@@ -65,6 +66,11 @@ echo "==> binaries execute and report the pinned versions"
 "$work/usr/local/bin/buildkitd" --version
 "$work/usr/local/bin/buildkitd" --version | grep -q "${BUILDKIT_VERSION#v}" \
     || { echo "buildkitd version does not match $BUILDKIT_VERSION"; exit 1; }
+
+echo "==> hawser-agent identity matches what the rootfs declares"
+"$work/usr/local/bin/hawser-agent" -version
+test "$("$work/usr/local/bin/hawser-agent" -version)" = "$(cat "$work/etc/hawser/agent-version")" \
+    || { echo "agent-version file does not match the binary"; exit 1; }
 
 echo "==> provenance: one pinned commit per component"
 cat "$work/etc/hawser/commits"

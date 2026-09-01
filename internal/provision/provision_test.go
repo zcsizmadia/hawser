@@ -137,6 +137,17 @@ func healthyWSL() *fakeWSL {
 	return &fakeWSL{status: wsl.Status{Installed: true, DefaultVersion: 2, Version: "2.7.8.0"}}
 }
 
+// startedMatching counts fake-started commands whose joined argv contains s.
+func startedMatching(w *fakeWSL, s string) int {
+	n := 0
+	for _, args := range w.started {
+		if strings.Contains(strings.Join(args, " "), s) {
+			n++
+		}
+	}
+	return n
+}
+
 // rootfsServer serves a payload and returns its URL and SHA-256.
 func rootfsServer(t *testing.T, payload []byte) (url, sum string) {
 	t.Helper()
@@ -185,8 +196,13 @@ func TestInstallHappyPath(t *testing.T) {
 	if _, err := os.Stat(w.imported[0][2]); err != nil {
 		t.Errorf("rootfs not on disk at import time: %v", err)
 	}
-	if len(w.started) != 1 {
-		t.Errorf("started %d commands, want 1 (dockerd)", len(w.started))
+	if n := startedMatching(w, "dockerd"); n != 1 {
+		t.Errorf("dockerd started %d times, want 1", n)
+	}
+	// The vsock agent (#40) rides along with every engine start; its command
+	// carries its own "not in this rootfs" and "already running" guards.
+	if n := startedMatching(w, "hawser-agent"); n != 1 {
+		t.Errorf("hawser-agent started %d times, want 1", n)
 	}
 
 	if m.EngineVersion != "29.7.2" || m.WSLVersion != "2.7.8.0" {
@@ -373,8 +389,8 @@ func TestStartEngineWaitsForSocket(t *testing.T) {
 	if err := p.StartEngine(context.Background(), opts); err != nil {
 		t.Fatalf("StartEngine: %v", err)
 	}
-	if len(w.started) != 1 {
-		t.Errorf("started %d commands, want 1", len(w.started))
+	if n := startedMatching(w, "dockerd"); n != 1 {
+		t.Errorf("dockerd started %d times, want 1", n)
 	}
 }
 
@@ -387,8 +403,13 @@ func TestStartEngineSkipsWhenAlreadyRunning(t *testing.T) {
 	if err := p.StartEngine(context.Background(), opts); err != nil {
 		t.Fatalf("StartEngine: %v", err)
 	}
-	if len(w.started) != 0 {
+	if n := startedMatching(w, "dockerd"); n != 0 {
 		t.Errorf("dockerd was launched even though the socket was already up")
+	}
+	// But the agent must still be ensured: a restarted supervisor finding a
+	// healthy engine cannot assume the vsock path is up.
+	if n := startedMatching(w, "hawser-agent"); n != 1 {
+		t.Errorf("hawser-agent ensured %d times, want 1", n)
 	}
 }
 

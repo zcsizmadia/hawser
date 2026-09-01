@@ -9,3 +9,4 @@ spike/a/dl/
 go.work
 go.work.sum
 engine-bin/
+/agent

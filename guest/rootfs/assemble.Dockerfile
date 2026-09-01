@@ -50,4 +50,5 @@ COPY wsl.conf /etc/wsl.conf
 # when no version is given, and `commits` is the provenance record a security
 # review reads.
 COPY engine-version /etc/hawser/engine-version
+COPY agent-version /etc/hawser/agent-version
 COPY commits /etc/hawser/commits

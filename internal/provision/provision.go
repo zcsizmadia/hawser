@@ -217,6 +217,10 @@ func (p *Provisioner) StartEngine(ctx context.Context, opts Options) error {
 
 	if running, _ := p.engineRunning(ctx, opts); running {
 		p.logger().Info("engine already running", "distro", opts.Distro)
+		// The agent's lifetime is not tied to dockerd's: a supervisor that
+		// finds a healthy engine (its own restart, say) must still make sure
+		// the vsock path is up.
+		p.startAgent(ctx, opts)
 		return nil
 	}
 
@@ -227,6 +231,7 @@ func (p *Provisioner) StartEngine(ctx context.Context, opts Options) error {
 		"sh", "-c", "dockerd >>/var/log/dockerd.log 2>&1"); err != nil {
 		return fmt.Errorf("launching dockerd: %w", err)
 	}
+	p.startAgent(ctx, opts)
 
 	deadline := time.Now().Add(opts.StartTimeout)
 	for time.Now().Before(deadline) {
@@ -245,6 +250,21 @@ func (p *Provisioner) StartEngine(ctx context.Context, opts Options) error {
 	log, _ := p.wsl().Exec(ctx, opts.Distro, "root", "tail", "-30", "/var/log/dockerd.log")
 	return fmt.Errorf("dockerd did not create %s within %s. Last log lines:\n%s",
 		EngineSocket, opts.StartTimeout, log)
+}
+
+// agentStartCmd is what launches hawser-agent (#40), guarded three ways: a
+// rootfs that predates the agent has nothing to start (the socat relay stays
+// the transport), an agent already running must not be doubled, and `exec`
+// keeps the process tree flat. Never fatal by design — the engine is fully
+// usable without the vsock path.
+const agentStartCmd = "command -v hawser-agent >/dev/null 2>&1 || exit 0; " +
+	"pgrep -x hawser-agent >/dev/null 2>&1 && exit 0; " +
+	"exec hawser-agent >>/var/log/hawser-agent.log 2>&1"
+
+func (p *Provisioner) startAgent(ctx context.Context, opts Options) {
+	if _, err := p.wsl().Start(ctx, opts.Distro, "root", "sh", "-c", agentStartCmd); err != nil {
+		p.logger().Debug("hawser-agent not started", "error", err)
+	}
 }
 
 func (p *Provisioner) engineRunning(ctx context.Context, opts Options) (bool, error) {
