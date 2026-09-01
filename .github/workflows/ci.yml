@@ -36,8 +36,18 @@ jobs:
 
       # The Spike A relay is a separate throwaway module — keep it compiling
       # until the real pipeproxy replaces it, then this step goes away.
-      - name: build spike relay
-        working-directory: spike/a/relay
+      # Spikes are separate throwaway modules, kept compiling so they stay
+      # runnable until their issue closes and they are deleted.
+      - name: build spike modules
+        shell: pwsh
         run: |
-          go mod tidy
-          go build ./...
+          Get-ChildItem -Path spike -Recurse -Filter go.mod | ForEach-Object {
+            $dir = $_.Directory.FullName
+            Write-Host "== $dir"
+            Push-Location $dir
+            go mod tidy
+            if ($LASTEXITCODE -ne 0) { Pop-Location; exit 1 }
+            go build ./...
+            if ($LASTEXITCODE -ne 0) { Pop-Location; exit 1 }
+            Pop-Location
+          }
