@@ -5,8 +5,9 @@
     "'latest at install time': this file is compiled into the binary, so a",
     "given Hawser build always installs exactly these components.",
     "",
-    "rootfs.sha256 is filled in when a rootfs release is published. While it is",
-    "empty, `hawser install` refuses and tells the user to pass --rootfs-url and",
+    "rootfs.sha256 is filled in when a rootfs release is published, copied from",
+    "the .sha256 asset the rootfs workflow attaches. While it is empty,",
+    "`hawser install` refuses and tells the user to pass --rootfs-url and",
     "--rootfs-sha256 explicitly, rather than silently installing something",
     "unverified. Keep these values in step with guest/rootfs/versions.env."
   ],
@@ -16,7 +17,7 @@
       "default": true,
       "rootfs": {
         "url": "https://github.com/zcsizmadia/hawser/releases/download/rootfs-v29.7.2/hawser-rootfs-29.7.2.tar.gz",
-        "sha256": ""
+        "sha256": "3b71fd164e4d6bdfa184688e58dda6e925c5be5df65520afa67cc00ace05ec18"
       },
       "components": {
         "dockerd": "29.7.2",

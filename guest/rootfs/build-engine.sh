@@ -43,8 +43,18 @@ echo "--- moby (dockerd) $MOBY_TAG"
 clone https://github.com/moby/moby.git "$MOBY_TAG" moby
 # VERSION is what `dockerd --version` reports; without it moby stamps "dev",
 # which the smoke test rejects and `hawser version` would misreport.
-(cd /src/moby && VERSION="$ENGINE_VERSION" ./hack/make.sh binary-daemon && \
-    find bundles -name dockerd -type f -exec cp {} /out/bin/ \;)
+# docker-proxy ships alongside dockerd and is not optional: with userland-proxy
+# enabled (the default) dockerd refuses to start without it -
+# "userland-proxy is enabled, but userland-proxy-path is not set". Copying only
+# dockerd produced a rootfs that imported cleanly and then would not boot.
+# binary-proxy is a separate target: binary-daemon builds only dockerd, and the
+# missing docker-proxy is what made the first published rootfs unbootable.
+(cd /src/moby && VERSION="$ENGINE_VERSION" ./hack/make.sh binary-daemon binary-proxy && \
+    for b in dockerd docker-proxy; do \
+        found=$(find bundles -name "$b" -type f | head -1); \
+        [ -n "$found" ] || { echo "moby build produced no $b"; exit 1; }; \
+        cp "$found" /out/bin/; \
+    done)
 
 echo "--- buildkit $BUILDKIT_VERSION"
 clone https://github.com/moby/buildkit.git "$BUILDKIT_VERSION" buildkit

@@ -27,8 +27,11 @@ trap 'rm -rf "$work"' EXIT
 tar -xzf "$tarball" -C "$work"
 
 echo "==> expected files"
-for f in usr/local/bin/dockerd usr/local/bin/containerd usr/local/bin/runc \
-         usr/local/bin/buildkitd etc/docker/daemon.json etc/wsl.conf \
+# docker-proxy is listed deliberately: dockerd refuses to start without it when
+# userland-proxy is enabled, and `dockerd --validate` does not catch that - the
+# first rootfs release imported fine and then failed at startup.
+for f in usr/local/bin/dockerd usr/local/bin/docker-proxy usr/local/bin/containerd \
+         usr/local/bin/runc usr/local/bin/buildkitd etc/docker/daemon.json etc/wsl.conf \
          etc/hawser/engine-version etc/hawser/commits; do
     test -e "$work/$f" || { echo "missing $f"; exit 1; }
     echo "  ok $f"
