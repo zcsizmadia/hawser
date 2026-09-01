@@ -81,6 +81,7 @@ func TestAcceptance(t *testing.T) {
 		{"LogsFollowStreams", stageLogsFollow},
 		{"ComposeStack", stageCompose},
 		{"WSLIntegrateSharesEngine", stageWSLIntegrate},
+		{"MigrateFromDesktop", stageMigrate},
 		{"IdleStopAndOnDemandWake", stageIdle},
 		{"InterruptedClientDoesNotWedgeBridge", stageInterrupt},
 		{"VsockPathServedEverything", stageVsockServed},
@@ -110,6 +111,30 @@ func run(t *testing.T, timeout time.Duration, name string, args ...string) (stri
 		out, err = cmd.CombinedOutput()
 		close(done)
 	}()
+	select {
+	case <-done:
+		return strings.TrimSpace(string(out)), err
+	case <-time.After(timeout):
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		<-done
+		return strings.TrimSpace(string(out)), fmt.Errorf("%s timed out after %s", name, timeout)
+	}
+}
+
+// runEnv is run() with an explicit environment, for subprocesses that shell
+// out to docker and thus need docker's credential helper on PATH (hostEnv adds
+// docker's own directory). A real `hawser migrate` inherits a shell where
+// Docker Desktop is on PATH; the suite must reproduce that for its subprocess.
+func runEnv(t *testing.T, env []string, timeout time.Duration, name string, args ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	cmd.Env = env
+	done := make(chan struct{})
+	var out []byte
+	var err error
+	go func() { out, err = cmd.CombinedOutput(); close(done) }()
 	select {
 	case <-done:
 		return strings.TrimSpace(string(out)), err
@@ -516,6 +541,65 @@ func stageWSLIntegrate(t *testing.T, s *state) {
 	if _, err := run(t, 30*time.Second, "wsl.exe", "-d", "Ubuntu",
 		"--", "test", "-f", "/etc/profile.d/hawser.sh"); err == nil {
 		t.Error("profile script still present after --remove")
+	}
+}
+
+func stageMigrate(t *testing.T, s *state) {
+	// #43 end to end against real Docker Desktop: seed a distinctive image and
+	// a volume with known contents in Desktop, migrate ONLY those into the
+	// Hawser engine (--only keeps this from copying the developer's whole
+	// Desktop), and prove they arrived intact while Desktop is untouched.
+	if !s.ddWorkedBefore {
+		t.Skip("Docker Desktop was not serving before the suite; nothing to migrate from")
+	}
+	const (
+		probeImg = "alpine:3.19"
+		probeVol = "hawser-e2e-migrate-probe"
+		marker   = "hawser-e2e-migrate-marker"
+	)
+	// Seed Desktop. Cleaned up regardless of outcome.
+	if out, err := s.runDocker(t, 3*time.Minute, "--context", "desktop-linux", "pull", probeImg); err != nil {
+		t.Skipf("cannot pull %s into Desktop (%v): %s", probeImg, err, out)
+	}
+	s.runDocker(t, 30*time.Second, "--context", "desktop-linux", "volume", "rm", "-f", probeVol)
+	vout, verr := s.runDocker(t, 30*time.Second, "--context", "desktop-linux", "volume", "create", probeVol)
+	must(t, vout, verr, "create source volume")
+	defer s.runDocker(t, 30*time.Second, "--context", "desktop-linux", "volume", "rm", "-f", probeVol)
+	sout, serr := s.runDocker(t, time.Minute, "--context", "desktop-linux", "run", "--rm",
+		"-v", probeVol+":/d", probeImg, "sh", "-c", "echo "+marker+" > /d/marker.txt")
+	must(t, sout, serr, "seed source volume")
+
+	// Migrate just the probe items into the suite's engine. hostEnv puts
+	// docker's dir on PATH so the credential helper resolves for the pull of
+	// the tar-helper image — the environment a real migrate already has.
+	out, err := runEnv(t, s.hostEnv(), 5*time.Minute, s.hawser, "migrate", "--from-desktop",
+		"--only", probeImg, "--only", probeVol, "--state-dir", s.stateDir,
+		"--docker", s.docker, "--docker-host", dockerHost)
+	must(t, out, err, "hawser migrate")
+
+	// Image arrived.
+	if got, err := dockerE(t, s, time.Minute, "images", probeImg, "--format", "{{.Repository}}:{{.Tag}}"); err != nil || got == "" {
+		t.Errorf("migrated image not on the Hawser engine: %q (%v)", got, err)
+	}
+	// Volume arrived with its contents intact — the real proof, not just presence.
+	got, err := dockerE(t, s, time.Minute, "run", "--rm", "-v", probeVol+":/d", probeImg, "cat", "/d/marker.txt")
+	if err != nil || got != marker {
+		t.Errorf("migrated volume content = %q (%v), want %q", got, err, marker)
+	}
+
+	// Desktop is untouched: the source volume and its data still there.
+	if src, err := s.runDocker(t, time.Minute, "--context", "desktop-linux", "run", "--rm",
+		"-v", probeVol+":/d", probeImg, "cat", "/d/marker.txt"); err != nil || src != marker {
+		t.Errorf("source volume changed by migration: %q (%v); it must be read-only", src, err)
+	}
+
+	// Re-running is a no-op (everything already present), and idempotent.
+	out, err = run(t, 2*time.Minute, s.hawser, "migrate", "--from-desktop",
+		"--only", probeImg, "--only", probeVol, "--state-dir", s.stateDir,
+		"--docker", s.docker, "--docker-host", dockerHost)
+	must(t, out, err, "hawser migrate (second run)")
+	if !strings.Contains(out, "Nothing to migrate") {
+		t.Errorf("second migrate should be a no-op, got:\n%s", out)
 	}
 }
 
