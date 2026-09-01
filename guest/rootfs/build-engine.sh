@@ -47,7 +47,9 @@ clone https://github.com/moby/moby.git "$MOBY_TAG" moby
 # enabled (the default) dockerd refuses to start without it -
 # "userland-proxy is enabled, but userland-proxy-path is not set". Copying only
 # dockerd produced a rootfs that imported cleanly and then would not boot.
-(cd /src/moby && VERSION="$ENGINE_VERSION" ./hack/make.sh binary-daemon && \
+# binary-proxy is a separate target: binary-daemon builds only dockerd, and the
+# missing docker-proxy is what made the first published rootfs unbootable.
+(cd /src/moby && VERSION="$ENGINE_VERSION" ./hack/make.sh binary-daemon binary-proxy && \
     for b in dockerd docker-proxy; do \
         found=$(find bundles -name "$b" -type f | head -1); \
         [ -n "$found" ] || { echo "moby build produced no $b"; exit 1; }; \
