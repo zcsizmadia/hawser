@@ -19,11 +19,25 @@ type Fetcher interface {
 	Fetch(ctx context.Context, url string) (io.ReadCloser, error)
 }
 
-// HTTPFetcher retrieves over HTTP(S) using the given client.
+// HTTPFetcher retrieves a rootfs over HTTP(S), or from the local filesystem for
+// a file:// URL or a plain path.
+//
+// Local paths are supported because a development install and the acceptance
+// suite both need to install a rootfs built by guest/rootfs/build.sh before any
+// release exists — which is exactly what ErrNotPublished tells the user to do.
+// Verification is identical either way: a local rootfs is checksummed too.
 type HTTPFetcher struct{ Client *http.Client }
 
 // Fetch implements Fetcher.
 func (f HTTPFetcher) Fetch(ctx context.Context, url string) (io.ReadCloser, error) {
+	if path, ok := localPath(url); ok {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("opening local rootfs %s: %w", path, err)
+		}
+		return file, nil
+	}
+
 	client := f.Client
 	if client == nil {
 		client = http.DefaultClient
@@ -41,6 +55,30 @@ func (f HTTPFetcher) Fetch(ctx context.Context, url string) (io.ReadCloser, erro
 		return nil, fmt.Errorf("fetching %s: HTTP %s", url, resp.Status)
 	}
 	return resp.Body, nil
+}
+
+// localPath recognizes a filesystem source and returns the path to open.
+//
+// Handles file:// URLs (including Windows' file:///C:/x and file://C:/x spellings)
+// and bare paths such as C:\build\rootfs.tar.gz — which is what someone
+// naturally passes to --rootfs-url after running the rootfs build.
+func localPath(raw string) (string, bool) {
+	if after, ok := strings.CutPrefix(raw, "file://"); ok {
+		// file:///C:/x -> /C:/x; strip the leading slash before a drive letter.
+		p := after
+		if len(p) > 2 && p[0] == '/' && p[2] == ':' {
+			p = p[1:]
+		}
+		return filepath.FromSlash(p), true
+	}
+	// A Windows drive path is not a URL scheme, despite the colon.
+	if len(raw) > 2 && raw[1] == ':' {
+		return filepath.FromSlash(raw), true
+	}
+	if strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, `\`) || strings.HasPrefix(raw, ".") {
+		return filepath.FromSlash(raw), true
+	}
+	return "", false
 }
 
 // ErrChecksumMismatch reports a rootfs whose contents do not match the expected

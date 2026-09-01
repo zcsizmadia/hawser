@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/zcsizmadia/hawser/internal/wsl"
@@ -165,12 +166,20 @@ func (p *Provisioner) Install(ctx context.Context, opts Options) (*Manifest, err
 		return nil, fmt.Errorf("importing %s: %w", opts.Distro, err)
 	}
 
+	engineVersion := opts.EngineVersion
+	if engineVersion == "" {
+		// The rootfs records what it actually contains, which is more
+		// trustworthy than a flag and is the only source available when the
+		// rootfs came from --rootfs-url rather than the release manifest.
+		engineVersion = p.engineVersionFromDistro(ctx, opts)
+	}
+
 	m := &Manifest{
 		Distro:        opts.Distro,
 		DataDir:       opts.DataDir,
 		RootfsURL:     opts.RootfsURL,
 		RootfsSHA256:  opts.RootfsSHA256,
-		EngineVersion: opts.EngineVersion,
+		EngineVersion: engineVersion,
 		InstalledAt:   time.Now().UTC(),
 		WSLVersion:    report.Status.Version,
 	}
@@ -184,6 +193,22 @@ func (p *Provisioner) Install(ctx context.Context, opts Options) (*Manifest, err
 		return m, fmt.Errorf("starting engine: %w", err)
 	}
 	return m, nil
+}
+
+// EngineVersionFile is where the rootfs records the engine it carries.
+const EngineVersionFile = "/etc/hawser/engine-version"
+
+// engineVersionFromDistro reads the version the rootfs declares. Best-effort:
+// a rootfs without the marker is unusual but not a reason to fail an install,
+// and `hawser version` reports an unknown engine rather than a wrong one.
+func (p *Provisioner) engineVersionFromDistro(ctx context.Context, opts Options) string {
+	out, err := p.wsl().Exec(ctx, opts.Distro, "root", "cat", EngineVersionFile)
+	if err != nil {
+		p.logger().Debug("rootfs declares no engine version",
+			"file", EngineVersionFile, "error", err)
+		return ""
+	}
+	return strings.TrimSpace(out)
 }
 
 // StartEngine launches dockerd and waits for its socket.
