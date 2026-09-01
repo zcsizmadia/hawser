@@ -67,6 +67,21 @@ echo "==> assembling rootfs"
 root="$work/rootfs"
 mkdir -p "$root"
 tar -xzf "$work/$base" -C "$root"
+
+# Runtime packages the engine and the bridge need. The Alpine minirootfs has
+# none of them, and their absence is invisible until the artifact is actually
+# booted: without iptables dockerd cannot set up container networking, and
+# without socat the v0.1 pipe relay has nothing to connect the Windows side to.
+# Installed with apk --root from a matching Alpine container, so the versions
+# come from the same branch as the base.
+echo "==> installing guest packages"
+docker run --rm -v "$root:/rootfs" "alpine:${ALPINE_BRANCH#v}" sh -c '
+    set -eu
+    cp /etc/apk/repositories /rootfs/etc/apk/repositories
+    apk add --root /rootfs --no-cache \
+        socat iptables ip6tables iproute2 ca-certificates
+'
+
 install -d "$root/usr/local/bin" "$root/etc/docker" "$root/etc/hawser"
 install -m 0755 "$engine/bin/"* "$root/usr/local/bin/"
 

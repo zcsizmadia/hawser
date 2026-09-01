@@ -57,6 +57,20 @@ flags:
 		return exitNotFound
 	}
 
+	// Make sure the engine is actually up before serving the pipe.
+	//
+	// A distro shuts down when its last process exits, so the dockerd that
+	// `hawser install` started does not outlive the install. Until the v0.2
+	// supervisor exists, the proxy is the long-lived process, so starting the
+	// engine is its job — otherwise every client sees an EOF and the bridge
+	// looks broken when the engine is merely absent.
+	startOpts := opts
+	startOpts.Distro = targetDistro
+	if err := p.StartEngine(interruptCtx(), startOpts); err != nil {
+		fmt.Fprintf(os.Stderr, "hawser: %v\n", err)
+		return exitError
+	}
+
 	selected, reason := pipeproxy.SelectPipeName(*pipeName)
 	dockerHost := pipeproxy.DockerHostFor(selected)
 

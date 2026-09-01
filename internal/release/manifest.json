@@ -17,7 +17,7 @@
       "default": true,
       "rootfs": {
         "url": "https://github.com/zcsizmadia/hawser/releases/download/rootfs-v29.7.2/hawser-rootfs-29.7.2.tar.gz",
-        "sha256": "3b71fd164e4d6bdfa184688e58dda6e925c5be5df65520afa67cc00ace05ec18"
+        "sha256": "2effb0c2bd74a775094a094a0798d1feb0806e0ce478f9a30435b64d903f1e90"
       },
       "components": {
         "dockerd": "29.7.2",
