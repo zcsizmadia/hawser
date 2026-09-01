@@ -1,0 +1,160 @@
+# Hawser · Execution Roadmap
+
+Companion to [PLAN.md](PLAN.md) §05 — that file says *what* each milestone contains and why; this one says *in what order, by when, gated on what*. Assumptions: one developer, weekend cadence (~2 focused days/weekend), calendar anchored to a start the week of **2026-09-07**. Dates are targets, not promises — the gates are the contract, the dates are the pace check.
+
+**Strategic clock:** Microsoft targets wslc GA for **fall 2026**. wslc ships daemonless — no Docker API — so it is not a threat, but its GA press cycle is a free marketing wave. **v0.1 must be public and installable before that wave** so every "wslc can't run compose/Testcontainers" thread has a link-able answer. That makes early October a real deadline, not an aspiration.
+
+---
+
+## Phase 0 — Foundations & spikes (week of Sep 7, one week, evenings + weekend)
+
+Everything here either de-risks the architecture or claims ground that gets more expensive later. Nothing downstream starts until the two spike gates pass.
+
+| # | Task | Output | Gate |
+|---|---|---|---|
+| 0.1 | Reserve the name: GitHub org, winget/scoop/choco IDs, domain, USPTO/EUIPO sanity search | reservations done | — |
+| 0.2 | **Spike A — manual end-to-end**: hand-built Alpine+dockerd tar, `wsl --import`, throwaway pipe relay script, `docker ps` from PowerShell (download.docker.com static bundle OK here only) | written spike notes: latency, half-close behavior, gotchas | **GO/NO-GO: the path works at all** |
+| 0.3 | **Spike B — session-0**: start WSL2 + dockerd from a Windows service with no user logged in; try dedicated service account, then boot scheduled task with stored token | which pattern works, on which Windows builds | **GO/NO-GO for the CI market claim** |
+| 0.4 | Repo skeleton: Apache-2.0, Go module, lint/test workflow, layout from PLAN §08 | pushable repo (private) | — |
+| 0.5 | Rootfs CI pipeline v0: Alpine + engine **built from moby/containerd/runc source**, tar + SHA256 + SBOM as release asset | reproducible rootfs artifact | blocks 1.2 |
+
+**Gate outcomes.** Spike A failing means the architecture is wrong — stop and rethink (very unlikely; the DIY guides prove it daily). Spike B failing on all patterns doesn't kill the project — it demotes "no-login CI runner" from headline to "requires auto-logon workaround," and PLAN §06 gets rewritten honestly. Decide *now*, not at v1.0.
+
+---
+
+## v0.1 — Plumbing (3 weekends → target **Sun Oct 4, 2026**, public repo + tagged release)
+
+Goal: CLI-only, fresh Windows 11 VM → `docker run hello-world` in <5 min. Shippable and useful on its own.
+
+| Weekend | Work | Depends on |
+|---|---|---|
+| W1 (Sep 12–13) | Pipe proxy v1: `go-winio` server, per-connection `wsl.exe` stdio relay; unit tests for half-close, hijacked streams (`exec -it`), concurrent connections | Spike A notes |
+| W2 (Sep 19–20) | Windows→WSL volume path translation in the proxy (`-v C:\src:/app`); provisioner: preflight (`wsl --status`, exact enable-and-reboot instructions), rootfs download+verify, `wsl --import`, `daemon.json` (log rotation, `host.docker.internal` with NAT/mirrored-aware host IP), `--headless`, `--engine-version`, `--data-dir` | 0.5 rootfs artifact |
+| W3 (Sep 26–27) | Bundle docker CLI + compose + buildx + wincred per version manifest; `hawser` context creation with Desktop-coexistence pipe fallback; PATH-shadowing detection; `hawser version --json`; `hawser uninstall`; acceptance runs on clean VM | W1 + W2 |
+
+**Exit criteria (all must pass on a fresh Win11 VM):**
+- [ ] install → `docker run hello-world` < 5 min, user never touches WSL
+- [ ] compose stack (multi-service, healthcheck `depends_on`, Windows-path binds, `logs -f`) `up --build` → `down` clean
+- [ ] minimal Testcontainers suite (one DB container test) passes against the pipe
+- [ ] `docker exec -it` interactive shell works (hijack correctness)
+- [ ] uninstall leaves the system byte-identical (context restored, no stray files)
+- [ ] coexists with an installed Docker Desktop (fallback pipe name, both contexts usable)
+
+**Retires risks:** architecture viability, Desktop coexistence, path translation. **Publish:** README with honest scope, comparison table stub, "wslc has no Docker API — Hawser is the real one" positioning paragraph.
+
+---
+
+## v0.2 — Always-on (3 weekends → target **Sun Nov 8, 2026**)
+
+Goal: survives everything Windows throws at it, including nobody logged in. This is the milestone that makes the CI claim real.
+
+| Weekend | Work | Depends on |
+|---|---|---|
+| W4 (Oct 10–11) | Windows service (`x/sys/windows/svc`): supervise distro + dockerd, restart on crash and on user `wsl --shutdown`, boot start; structured logging (Event Log + rotating file) | v0.1 |
+| W5 (Oct 17–18) | Session-0 productization per Spike B's winning pattern; sleep/resume + network-change recovery (power events → socket re-verify) | Spike B |
+| W6 (Oct 31–Nov 1) | Guest agent over AF_HYPERV vsock (replaces per-connection spawn; latency parity with Desktop); on-demand start + `idle-timeout` via `hawser config`; `wsl-integrate`; `migrate --from-desktop`; tray (6 items) | W4 |
+
+**Exit criteria:**
+- [ ] kill `wsl.exe` / `wsl --shutdown` / reboot / sleep-resume → next `docker ps` works, zero clicks
+- [ ] service-account install runs a container job with **no user logged in**
+- [ ] pipe round-trip latency within 2× of Docker Desktop on `docker version` (vsock agent)
+- [ ] `migrate --from-desktop` round-trips images + volumes on a machine with real Desktop state
+- [ ] idle-timeout stops the VM; first `docker ps` after cold-starts it in ~2 s
+
+**Retires risks:** session-0 (the CI differentiator), idle-RAM complaint. **Note:** wslc GA likely lands during this window — have the v0.1 comparison post ready to ride it.
+
+---
+
+## v0.3 — Doctor, VPN & housekeeping (3 weekends → target **Sun Dec 13, 2026**)
+
+Goal: turn the WSL2 quirk zoo into a diagnosable surface. Sequenced *after* two releases so real v0.1/v0.2 issue reports seed the check list — doctor built in a vacuum diagnoses the wrong things.
+
+| Weekend | Work | Depends on |
+|---|---|---|
+| W7 (Nov 14–15) | `doctor` framework (one check = one file + one test), first checks: WSL version, virtualization, pipe ACL/health, disk, port conflicts, PATH shadowing, manifest mismatch, API skew; `--report` markdown | issue data from v0.1/0.2 |
+| W8 (Nov 28–29) | VPN battery: mirrored networking / dnsTunneling / autoProxy platform fixes (consented global config), VPN fingerprint DB (GlobalProtect, AnyConnect, Zscaler), MTU/DNS fallbacks, opt-in relay; proxy + registry-mirror first-class config | W7 |
+| W9 (Dec 12–13) | Housekeeping: sparse VHDX, `compact`, memory reclaim, `data-dir` relocation; `engine upgrade`/`rollback` staged swap; `stats` vmmem attribution; `enable-qemu`; SSH-agent bridging | v0.2 service |
+
+**Exit criteria:**
+- [ ] doctor correctly diagnoses the **top 5 failure classes from actual v0.1/v0.2 issues** (measured against the tracker, not hypotheticals)
+- [ ] GlobalProtect-equipped test machine reaches a registry through the tunnel after `doctor --fix`
+- [ ] `engine upgrade` → deliberate break → `rollback` restores a working engine with data intact
+- [ ] `docker build --ssh default` works via the SSH-agent bridge
+
+**Needs procured:** a test machine (or VM) with a real corporate VPN client — line this up during v0.2, not in W8.
+
+---
+
+## v0.4 — Ship it (2 weekends → target **Sun Jan 24, 2027**)
+
+Goal: the difference between a repo and a tool people install at work. Holiday gap absorbed here deliberately.
+
+| Weekend | Work | Depends on |
+|---|---|---|
+| W10 (Jan 9–10) | Code signing (Azure Trusted Signing or SignPath OSS — apply for SignPath **during v0.3**, approval takes weeks); winget/scoop/choco manifests; WiX MSI; ARM64 builds; `hawser update --check` | v0.3 tagged |
+| W11 (Jan 23–24) | `expose --tcp` mTLS; LAN port mirroring (opt-in); ADMX/registry policy layer; Defender-for-Endpoint WSL-plugin validation + doc; docs site, demo GIF, comparison table, CONTRIBUTING, issue templates with `doctor --report` pre-wired | W10 |
+
+**Exit criteria:**
+- [ ] `winget install hawser` on a clean machine — no SmartScreen wall
+- [ ] MSI deploys silently via Intune-style unattended flags
+- [ ] a security reviewer can walk checksum → SBOM → source commit for every shipped byte
+
+**Lead-time items to start early:** SignPath application (during v0.3), winget package review queue (can take 1–2 weeks), SmartScreen reputation begins accruing only after signing — sign *pre-release* builds from v0.3 onward if possible.
+
+---
+
+## v0.5 — Power tools (2 weekends → target **Sun Feb 21, 2027**)
+
+Kept out of v0.4 so the ship-it release stays tight.
+
+| Weekend | Work |
+|---|---|
+| W12 (Feb 6–7) | `snapshot create/restore` (VHDX copy while stopped); `create --name` side-by-side engines, each its own distro + context |
+| W13 (Feb 20–21) | Opt-in prune policy + tray disk-quota alert; `cache enable` pull-through mirror; PowerShell + bash completions |
+
+**Exit criteria:** snapshot → break everything → restore is bit-perfect; two engines run simultaneously with independent contexts.
+
+---
+
+## v1.0 — Stable (spring 2027, ongoing)
+
+Reliability guarantees, not features: self-hosted e2e runner with nested virtualization, Windows compatibility matrix (Win11 23H2/24H2+/Insider; Win10 22H2-ESU best-effort), semver + upgrade guarantees, published pipe threat model. **Acceptance:** two consecutive Windows feature updates absorbed with zero breaking issues filed.
+
+---
+
+## Decision gates & tripwires (standing)
+
+| Trigger | Watch | Response |
+|---|---|---|
+| Spike A fails | week 1 | stop, rethink architecture |
+| Spike B fails all patterns | week 1 | demote CI headline; rewrite PLAN §06 before v0.1 publishes |
+| wslc GA announcement | fall 2026 (during v0.2) | publish comparison post same week; no roadmap change |
+| **microsoft/WSL#40976** gets a maintainer reply, milestone, or shipped endpoint | continuous | deliberate positioning review: Hawser's glue layer (doctor, service, policy, path-translating pipe) can sit atop wslc's endpoint |
+| virtiofs reaches standard WSL distros | continuous | adopt immediately — attacks slow-9P bind mounts for free |
+| WSL platform memory-reclaim ships broadly | continuous | shrink `compact` to a thin wrapper |
+| Windows Insider feature-update flights | before each Windows FU | run e2e suite on Insider before the update GAs |
+
+## Impact backlog — candidates, not commitments
+
+Ideas that could raise the project's ceiling, held here until a milestone earns them. Each names the audience it unlocks; none may violate the scope rules in PLAN §01.
+
+| Idea | Audience unlocked | Earliest slot |
+|---|---|---|
+| **`hawser enable-gpu`** — nvidia-container-toolkit in the rootfs, `docker run --gpus all` (WSL2 already passes CUDA through) | local-AI developers (Ollama, vLLM, CUDA builds) — the largest new Docker-on-Windows audience of 2025–26, and Desktop parity Hawser otherwise lacks | v0.5 |
+| **`hawser install --config hawser.yaml`** — declarative fleet config (engine version, mirrors, proxy, data-dir) checked into the runner-provisioning repo | platform teams; makes the CI story infrastructure-as-code instead of flag soup | v0.3 |
+| **`setup-hawser` GitHub Action + `hawser bake`** — prebaked ready-to-import VHDX for ephemeral runners (seconds, not minutes) | self-hosted CI at fleet scale; formalizes PLAN §06's caching aside into a product surface | v0.4 |
+| **Validated Dev Containers + Visual Studio Container Tools compatibility** — test, document, and fix the pipe against VS Code devcontainers and full Visual Studio's Docker tooling (which historically probes for Desktop specifically) | the exact .NET enterprise audience that left Desktop over licensing; a compat shim here may be the single highest-leverage enterprise unlock | validate in v0.1 acceptance, shim if needed in v0.3 |
+| **One-line bootstrap** — `irm https://hawser.dev/install.ps1 \| iex` (signed, checksum-verified) | everyone, pre-winget; the README's first command | v0.1 |
+| **Publish the doctor VPN knowledge base as docs pages** — every fingerprinted failure gets a public URL | SEO: "WSL2 VPN DNS not working" searchers become users; turns support load into acquisition | v0.4 docs site |
+| **`hawser migrate --from-rancher / --from-podman`** — same lever as `--from-desktop` | the second- and third-place switcher pools | v0.5 |
+| **Opt-in local health metrics** — `hawser status --prometheus` textfile/endpoint (local only; the no-telemetry promise is about *us*, not about the user's own monitoring) | fleet operators who need runner health in their dashboards | v0.5 |
+| **Sustainability** — GitHub Sponsors from day one; later a paid priority-support tier for fleets (the product stays 100 % free) | keeps the maintainer maintaining; enterprises *want* someone to pay | v0.4 |
+
+## Working agreements
+
+- **Every milestone tags a release** — even v0.1 — with the locked version manifest. No "install from main."
+- **Determinism is the brand:** nothing auto-updates, nothing fetches "latest," ever. Break this once in CI and the sharpest wedge market is gone.
+- **Issue tracker feeds doctor:** every v0.1/v0.2 support issue gets a `doctor-candidate` label; W7 starts by triaging that list.
+- **Scope tripwire:** any proposed tray item beyond six, or any container-management feature, is answered with the Portainer one-liner.
+
+*owner: zcsizmadia · created 2026-08-31 · re-baseline dates if any milestone slips by more than two weekends*
