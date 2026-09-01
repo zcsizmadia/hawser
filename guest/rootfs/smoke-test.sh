@@ -29,7 +29,7 @@ tar -xzf "$tarball" -C "$work"
 echo "==> expected files"
 for f in usr/local/bin/dockerd usr/local/bin/containerd usr/local/bin/runc \
          usr/local/bin/buildkitd etc/docker/daemon.json etc/wsl.conf \
-         etc/hawser/engine-version; do
+         etc/hawser/engine-version etc/hawser/commits; do
     test -e "$work/$f" || { echo "missing $f"; exit 1; }
     echo "  ok $f"
 done
@@ -47,8 +47,23 @@ echo "==> binaries execute and report the pinned versions"
 "$work/usr/local/bin/dockerd" --version | grep -q "$ENGINE_VERSION" \
     || { echo "dockerd version does not match $ENGINE_VERSION"; exit 1; }
 "$work/usr/local/bin/containerd" --version
+"$work/usr/local/bin/containerd" --version | grep -q "${CONTAINERD_VERSION#v}" \
+    || { echo "containerd version does not match $CONTAINERD_VERSION"; exit 1; }
 "$work/usr/local/bin/runc" --version
+"$work/usr/local/bin/runc" --version | grep -q "${RUNC_VERSION#v}" \
+    || { echo "runc version does not match $RUNC_VERSION"; exit 1; }
+# Catches the "v0.0.0+unknown" trap: buildkit only reports a real version when
+# built with the ldflags in build-engine.sh.
 "$work/usr/local/bin/buildkitd" --version
+"$work/usr/local/bin/buildkitd" --version | grep -q "${BUILDKIT_VERSION#v}" \
+    || { echo "buildkitd version does not match $BUILDKIT_VERSION"; exit 1; }
+
+echo "==> provenance: one pinned commit per component"
+cat "$work/etc/hawser/commits"
+for c in moby containerd runc buildkit; do
+    grep -q "^$c " "$work/etc/hawser/commits" \
+        || { echo "no commit recorded for $c"; exit 1; }
+done
 
 echo "==> statically linked (no interpreter needed inside the minimal rootfs)"
 for b in dockerd containerd runc buildkitd; do

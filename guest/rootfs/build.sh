@@ -74,6 +74,9 @@ appendWindowsPath=false
 CONF
 
 printf '%s\n' "$ENGINE_VERSION" > "$root/etc/hawser/engine-version"
+# Exact upstream commit each binary was built from — the provenance record
+# `hawser version` and a security review both read.
+install -m 0644 "$work/commits.txt" "$root/etc/hawser/commits"
 
 tarball="$out/hawser-rootfs-${ENGINE_VERSION}.tar.gz"
 echo "==> writing $tarball"

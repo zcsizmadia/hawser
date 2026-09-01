@@ -11,8 +11,19 @@ mkdir -p /out/bin /src
 export CGO_ENABLED=0
 export GOFLAGS=-trimpath
 
+# Clone at a pinned tag and record the commit it resolved to.
+#
+# These are annotated tags, so refs/tags/<tag> points at a tag object rather
+# than a commit and git prints "warning: refs/tags/X ... is not a commit!"
+# during a shallow clone. It is cosmetic — git peels the tag and checks out the
+# right tree — but a tag can be moved upstream, so we pin the belt and record
+# the resolved SHA as the suspenders: that SHA is what the SBOM reports.
 clone() { # repo tag dir
-    git -c advice.detachedHead=false clone --depth 1 --branch "$2" "$1" "/src/$3"
+    git -c advice.detachedHead=false clone --depth 1 --branch "$2" "$1" "/src/$3" 2>&1 |
+        grep -v 'is not a commit!' || true
+    sha="$(git -C "/src/$3" rev-parse HEAD)"
+    printf '%s %s %s\n' "$3" "$2" "$sha" >> /out/commits.txt
+    echo "    $3 $2 -> $sha"
 }
 
 echo "--- runc $RUNC_VERSION"
@@ -34,8 +45,13 @@ clone https://github.com/moby/moby.git "$MOBY_TAG" moby
 
 echo "--- buildkit $BUILDKIT_VERSION"
 clone https://github.com/moby/buildkit.git "$BUILDKIT_VERSION" buildkit
-(cd /src/buildkit && go build -o /out/bin/buildkitd ./cmd/buildkitd && \
-    go build -o /out/bin/buildctl ./cmd/buildctl)
+# Without these ldflags buildkit reports "v0.0.0+unknown" — same trap as moby's
+# VERSION, and `hawser version` is supposed to report the truth.
+bk_rev="$(git -C /src/buildkit rev-parse HEAD)"
+bk_ld="-X github.com/moby/buildkit/version.Version=${BUILDKIT_VERSION#v}"
+bk_ld="$bk_ld -X github.com/moby/buildkit/version.Revision=$bk_rev"
+(cd /src/buildkit && go build -ldflags "$bk_ld" -o /out/bin/buildkitd ./cmd/buildkitd && \
+    go build -ldflags "$bk_ld" -o /out/bin/buildctl ./cmd/buildctl)
 
 strip /out/bin/* 2>/dev/null || true
 chmod 0755 /out/bin/*
