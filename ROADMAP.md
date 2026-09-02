@@ -75,23 +75,30 @@ The e2e suite (#11) runs on any Windows machine with WSL2 — the development ma
 
 ---
 
-## v0.3 — Doctor, VPN & housekeeping (3 weekends → target **Sun Dec 13, 2026**)
+## v0.3 — Doctor, corporate networks & self-contained (staged S1–S4)
 
-Goal: turn the WSL2 quirk zoo into a diagnosable surface. Sequenced *after* two releases so real v0.1/v0.2 issue reports seed the check list — doctor built in a vacuum diagnoses the wrong things.
+*(Re-baselined 2026-09-01: v0.2 landed ~3 months ahead of the original calendar, and its scope grew by agreement — the two "wildcards" (CLI bundling, devcontainer validation) and a customization layer joined the milestone. Weekend dates dropped in favor of stages; the owner re-dates as capacity allows.)*
 
-| Weekend | Work | Depends on |
-|---|---|---|
-| W7 (Nov 14–15) | `doctor` framework (one check = one file + one test), first checks: WSL version, virtualization, pipe ACL/health, disk, port conflicts, PATH shadowing, manifest mismatch, API skew; `--report` markdown | issue data from v0.1/0.2 |
-| W8 (Nov 28–29) | VPN battery: mirrored networking / dnsTunneling / autoProxy platform fixes (consented global config), VPN fingerprint DB (GlobalProtect, AnyConnect, Zscaler), MTU/DNS fallbacks, opt-in relay; proxy + registry-mirror first-class config | W7 |
-| W9 (Dec 12–13) | Housekeeping: sparse VHDX, `compact`, memory reclaim, `data-dir` relocation; `engine upgrade`/`rollback` staged swap; `stats` vmmem attribution; `enable-qemu`; SSH-agent bridging | v0.2 service |
+Goal: turn the WSL2 quirk zoo into a diagnosable surface, make the engine work on corporate networks, and cut the last dependency on Docker Desktop's binaries. Doctor is sequenced after two releases so real v0.1/v0.2 findings seed the check list — and v0.2 delivered exactly that seed (credential-helper PATH, the `run -i` half-close class, supervisor/status disagreement, the session-0 rights question).
+
+| Stage | Work | Issues | Depends on |
+|---|---|---|---|
+| S1 | `doctor` framework (one check = one file + one test; `--json`, `--report` markdown, `--fix`), checks seeded from the real v0.1/v0.2 failure list; fix the two known bugs its checks reference (supervisor-mutex path normalization, idle vs wsl-integrate activity) | #61, #71, #72 | v0.2 tagged |
+| S2 | Corporate networks: CA-trust injection + proxy passthrough + registry mirrors; validated engine-config surface (`config set engine.<key>`, `dockerd --validate` before apply); VPN battery (consented platform fixes, fingerprint DB, MTU/DNS fallbacks) | #62, #68, #63 | S1 (doctor hosts the diagnoses) |
+| S3 | Housekeeping: sparse VHDX, `compact`, memory reclaim, `data-dir` relocation; `engine upgrade`/`rollback` staged swap; `stats` vmmem attribution; SSH-agent bridging | #64, #65 | v0.2 supervisor |
+| S4 | Self-contained & declarative: bundle docker CLI + compose + buildx + credential helper (pinned fetch at install); `hawser install --config hawser.yaml`; lifecycle hooks; Dev Containers + Visual Studio container-tools validation (shim if needed) | #66, #69, #70, #67 | S2 (config surface) |
 
 **Exit criteria:**
 - [ ] doctor correctly diagnoses the **top 5 failure classes from actual v0.1/v0.2 issues** (measured against the tracker, not hypotheticals)
-- [ ] GlobalProtect-equipped test machine reaches a registry through the tunnel after `doctor --fix`
+- [ ] a VPN-equipped test machine reaches a private registry through the tunnel after `doctor --fix` (CA + proxy + DNS all diagnosed, not guessed)
 - [ ] `engine upgrade` → deliberate break → `rollback` restores a working engine with data intact
+- [ ] a clean machine **without Docker Desktop** installs Hawser and `docker run hello-world` works using only bundled binaries
+- [ ] `hawser install --config hawser.yaml` on a fresh machine converges to the same state as the equivalent flags, and re-running is a no-op
 - [ ] `docker build --ssh default` works via the SSH-agent bridge
 
-**Needs procured:** a test machine (or VM) with a real corporate VPN client — line this up during v0.2, not in W8.
+**Deliberately staged to v0.5, not lost:** network-aware profiles (#73), engine lockfile (#74), verified air-gap install (#75) — they compose the S2/S4 plumbing rather than precede it.
+
+**Needs procured:** a test machine (or VM) with a real corporate VPN client — line this up before S2, not during it.
 
 ---
 
