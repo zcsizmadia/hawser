@@ -83,7 +83,8 @@ Goal: turn the WSL2 quirk zoo into a diagnosable surface, make the engine work o
 
 | Stage | Work | Issues | Depends on |
 |---|---|---|---|
-| S1 | `doctor` framework (one check = one file + one test; `--json`, `--report` markdown, `--fix`), checks seeded from the real v0.1/v0.2 failure list; fix the two known bugs its checks reference (supervisor-mutex path normalization, idle vs wsl-integrate activity) | #61, #71, #72 | v0.2 tagged |
+| S0 | Review remediation: an independent 4-agent Fable review of v0.2.0 (breadth + security + concurrency + protocol) gated v0.3; its P1s land before feature work — pipe DACL, stop-vs-idle flap, vsock mutual auth, health-probe rework, idle vs shared-socket traffic. P2/P3 findings (#84–#94) fold into the later stages. | #79, #80, #81, #82, #72 | v0.2.0 + review |
+| S1 | `doctor` framework (one check = one file + one test; `--json`, `--report` markdown, `--fix`), checks seeded from the real v0.1/v0.2 failure list and the S0 review findings; fix the supervisor-mutex bugs its checks reference | #61, #71 | S0 |
 | S2 | Corporate networks: CA-trust injection + proxy passthrough + registry mirrors; validated engine-config surface (`config set engine.<key>`, `dockerd --validate` before apply); VPN battery (consented platform fixes, fingerprint DB, MTU/DNS fallbacks) | #62, #68, #63 | S1 (doctor hosts the diagnoses) |
 | S3 | Housekeeping: sparse VHDX, `compact`, memory reclaim, `data-dir` relocation; `engine upgrade`/`rollback` staged swap; `stats` vmmem attribution; SSH-agent bridging | #64, #65 | v0.2 supervisor |
 | S4 | Self-contained & declarative: bundle docker CLI + compose + buildx + credential helper (pinned fetch at install); `hawser install --config hawser.yaml`; lifecycle hooks; Dev Containers + Visual Studio container-tools validation (shim if needed) | #66, #69, #70, #67 | S2 (config surface) |
