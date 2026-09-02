@@ -6,40 +6,55 @@ A minimal, invisible way to run the upstream open source **Docker Engine on Wind
 No license fees, no Electron, no Kubernetes — install once, `docker ps` works forever, on
 laptops and CI runners alike.
 
-**Status: v0.1 pre-release.** Installable and working; the always-on supervisor, tray,
-and doctor are still ahead. Read [PLAN.md](PLAN.md) for the strategy and
-[ROADMAP.md](ROADMAP.md) for the schedule; the
+**Status: v0.2 pre-release.** Installable and working as a daily driver: install once and
+the engine starts at every logon, heals itself, and answers `docker` at the same speed as
+Docker Desktop. `doctor` and a bundled docker CLI are next (v0.3). Read [PLAN.md](PLAN.md)
+for the strategy and [ROADMAP.md](ROADMAP.md) for the schedule; the
 [issue tracker](https://github.com/zcsizmadia/hawser/issues) is the live state.
 
-## Install (v0.1)
+## Install (v0.2)
 
 Requirements: Windows 11 with WSL2, and any `docker` CLI on PATH (Docker Desktop's works —
-Hawser coexists with it rather than replacing it).
+Hawser coexists with it rather than replacing it; a bundled CLI arrives in v0.3).
 
 1. Download the zip for your architecture from the
    [latest release](https://github.com/zcsizmadia/hawser/releases) and verify it against
    `SHA256SUMS` (binaries are not yet signed; SmartScreen will warn)
 2. `hawser.exe install` — downloads the checksum-verified engine rootfs, imports it as the
-   `hawser-engine` WSL2 distro, starts the engine, and wires a `hawser` docker context
-3. `hawser.exe proxy` — serves the named pipe (keep it running; the v0.2 supervisor
-   replaces this step)
-4. In another shell: `docker --context hawser run --rm hello-world`
+   `hawser-engine` WSL2 distro, starts the engine, wires a `hawser` docker context, and
+   registers the supervisor to start at logon (`--no-autostart` opts out)
+3. `hawser.exe start` — brings up the always-on bridge now (from your next logon it starts
+   itself)
+4. `docker --context hawser run --rm hello-world`
 
 `hawser.exe uninstall` removes everything Hawser created — the distro and all images and
-volumes in it — and restores your previous docker context. Nothing else on the system is
-touched.
+volumes in it, the autostart entry, any distro integrations — and restores your previous
+docker context. Nothing else on the system is touched.
 
-Known v0.1 limits: a logged-on session is required (a WSL2 platform constraint that binds
-every WSL-based engine), the proxy runs in the foreground, and Linux containers only.
+## What it does today (v0.2)
 
-## What it will be
+- Upstream Docker Engine (Linux containers) in a dedicated WSL2 distro — the real API, byte
+  for byte: compose, buildx, Testcontainers, `run -it`, bind mounts with Windows paths
+- **Always-on supervisor**: starts at logon, survives engine crashes, `wsl --shutdown`, and
+  sleep/resume; `hawser start/stop/restart/status --json`
+- **Docker Desktop speed**: a vsock transport to the engine (~80 ms `docker version`,
+  measured at parity with Desktop), with an automatic fallback path
+- **Idle RAM answer**: `hawser config set idle-timeout 30m` stops a quiet engine and
+  cold-starts it (~1 s engine start) on your next `docker` command
+- **`hawser wsl-integrate <distro>`**: use the engine from inside your own WSL distros
+- **`hawser migrate --from-desktop`**: copy images and volumes out of Docker Desktop,
+  non-destructively and resumably (`--dry-run` first)
+- Optional status-light tray (`hawsertray.exe`) — six menu items, forever
+- Headless CI installs (`--headless`, exit codes, `--json`), version pinning as a contract
+  (nothing fetches "latest"), no telemetry
+- A logged-on session is required — a WSL2 platform constraint that binds every WSL-based
+  engine; for CI runners see [docs/auto-logon-runner.md](docs/auto-logon-runner.md)
 
-- Upstream Docker Engine (Linux containers) in a dedicated WSL2 distro — the real API, byte for byte
-- A named-pipe bridge so stock `docker.exe`, compose, buildx, Testcontainers, and IDE
-  integrations work unmodified
-- A real Windows service: boot start, crash recovery, sleep/resume survival, no login required
-- Headless CI installs, version pinning as a contract, `doctor` for the WSL/VPN quirk zoo
-- A single Go binary under 15 MB, no telemetry
+## What's ahead (v0.3)
+
+`doctor` for the WSL/VPN quirk zoo, corporate proxy/CA support, a bundled docker CLI +
+compose + buildx, VHDX compaction, and pinned engine upgrades with rollback — tracked in the
+[v0.3 milestone](https://github.com/zcsizmadia/hawser/milestones).
 
 ## What it will never be
 
